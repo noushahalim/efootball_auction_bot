@@ -1,4 +1,4 @@
-# database/db.py - Enhanced Database Operations with MongoDB
+# database/db.py - Enhanced Database Operations with MongoDB...
 import motor.motor_asyncio
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
@@ -141,10 +141,17 @@ class Database:
     async def add_player_to_manager(self, user_id: int, player_name: str, price: int):
         """Add player to manager's collection with stats update"""
         try:
+            # Create player record
+            player_data = {
+                'name': player_name,
+                'price': price,
+                'bought_at': datetime.now()
+            }
+            
             result = await self.managers.update_one(
                 {"user_id": user_id},
                 {
-                    "$push": {"players": player_name},
+                    "$push": {"players": player_data},
                     "$inc": {
                         "statistics.auctions_won": 1,
                         "statistics.points": 10
@@ -1078,3 +1085,14 @@ class Database:
                 'error': str(e),
                 'timestamp': datetime.now()
             }
+        
+    async def get_manager_name(self, user_id: int) -> str:
+        """Get manager name with fallback"""
+        try:
+            manager = await self.managers.find_one({"user_id": user_id})
+            if manager and manager.get('name'):
+                return manager['name']
+            return f"User {user_id}"
+        except Exception as e:
+            logger.error(f"Error getting manager name: {e}")
+            return f"User {user_id}"

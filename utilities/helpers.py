@@ -54,8 +54,8 @@ class ValidationHelper:
         
     @staticmethod
     def validate_bid_amount(amount_str: str, current_bid: int, user_balance: int, 
-                          base_price: int) -> Tuple[bool, str, int]:
-        """Comprehensive bid validation"""
+                            base_price: int) -> Tuple[bool, str, int]:
+        """Comprehensive bid validation with proper increment rules"""
         try:
             # Clean amount string
             amount_str = str(amount_str).strip().replace(',', '').replace('₹', '')
@@ -72,31 +72,33 @@ class ValidationHelper:
                     
         except (ValueError, TypeError):
             return False, "Invalid amount! Use numbers only (e.g., 15 for 15M)", 0
-            
+        
         # Validate amount range
         if amount <= 0:
             return False, "Amount must be positive!", 0
-            
+        
         if amount > 10_000_000_000:  # 10B max
             return False, "Amount too high! Maximum 10B", 0
-            
-        # Check against current bid
-        if amount <= current_bid:
-            diff_needed = current_bid - amount + BID_INCREMENT
-            return False, f"Bid must exceed current bid! Need {diff_needed // 1_000_000}M more", 0
-            
-        # Check increment rules
-        if current_bid >= base_price + MAX_STRAIGHT_BID:
-            # Must follow increment rules
-            min_increment = BID_INCREMENT
-            if (amount - current_bid) < min_increment:
-                return False, f"Minimum increment is {min_increment // 1_000_000}M!", 0
-                
-        # Check user balance
+        
+        # Check against user balance
         if amount > user_balance:
             shortage = amount - user_balance
             return False, f"Insufficient balance! Need {shortage // 1_000_000}M more", 0
-            
+        
+        # Special bidding rules - FIXED LOGIC
+        if current_bid == 0:
+            # First bid must be base price
+            if amount != base_price:
+                return False, f"First bid must be base price: {base_price // 1_000_000}M", 0
+        elif current_bid >= base_price and current_bid < 20_000_000:
+            # Between base and 20M, only 1M increments allowed
+            if amount != current_bid + 1_000_000:
+                return False, f"Must bid exactly {(current_bid + 1_000_000) // 1_000_000}M (increment by 1M only until 20M)", 0
+        else:
+            # After 20M, any amount above current bid
+            if amount <= current_bid:
+                return False, f"Bid must be higher than current bid of {current_bid // 1_000_000}M", 0
+        
         return True, "Valid bid", amount
         
     @staticmethod

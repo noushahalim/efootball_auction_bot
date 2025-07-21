@@ -1,4 +1,4 @@
-# handlers/user_handlers.py - Enhanced User Handlers with Visual Features
+# handlers/user_handlers.py - Fixed User Handlers with Timer Reset...
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -23,6 +23,7 @@ class UserHandlers:
         self.validator = ValidationHelper()
         self.animations = AnimationManager()
         self.bid_cooldowns = {}  # Track bid cooldowns
+        self.admin_handlers = None  # Will be set by admin_handlers
         
     async def place_bid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /bid command with enhanced validation and visuals"""
@@ -216,7 +217,7 @@ Your balance: {self.formatter.format_currency(manager.balance)}
         return False
         
     async def _process_bid(self, update, context, auction, manager, bid_amount):
-        """Process a valid bid with animations"""
+        """Process a valid bid with timer reset"""
         try:
             # Create bid object
             bid = Bid(
@@ -226,36 +227,42 @@ Your balance: {self.formatter.format_currency(manager.balance)}
                 bid_type='manual'
             )
             
-            # Update auction
+            # Update auction in database
             await self.db.update_auction_bid(auction._id, bid)
             
-            # Create visual bid announcement
-            bid_msg = self.formatter.format_new_bid(
-                auction.player_name,
-                manager.name,
-                bid_amount,
-                time_left=None  # Will be updated by countdown
-            )
+            # Update manager name if needed
+            user_name = update.effective_user.full_name or update.effective_user.first_name
+            if manager.name != user_name:
+                await self.db.managers.update_one(
+                    {"user_id": manager.user_id},
+                    {"$set": {"name": user_name}}
+                )
+                manager.name = user_name
             
-            # Create quick bid buttons for others
-            keyboard = self._create_quick_bid_buttons(bid_amount, auction._id)
-            reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+            # Notify admin handlers to reset timer AND update display
+            if self.admin_handlers:
+                await self.admin_handlers.handle_new_bid(auction._id, manager.user_id, bid_amount, context)
             
-            # Send bid update with animation effect
-            bid_update = await context.bot.send_message(
-                AUCTION_GROUP_ID,
-                bid_msg,
-                parse_mode='HTML',
-                reply_markup=reply_markup
-            )
+            # Create bid announcement
+            bid_msg = f"""
+{EMOJI_ICONS['chart_up']} <b>NEW BID!</b>
+
+{EMOJI_ICONS['user']} {manager.name} bid {self.formatter.format_currency(bid_amount)}!
+            """.strip()
             
-            # Add reaction to show new bid
+            # Send brief bid notification
             try:
-                await bid_update.set_reaction("🔥")
+                notification = await context.bot.send_message(
+                    AUCTION_GROUP_ID,
+                    bid_msg,
+                    parse_mode='HTML'
+                )
+                # Delete after 3 seconds
+                asyncio.create_task(self._delete_message_after(notification, 3))
             except:
                 pass
-                
-            # Send private confirmation with balance update
+            
+            # Send private confirmation
             new_balance = manager.balance - bid_amount
             confirmation = f"""
 {EMOJI_ICONS['success']} <b>BID PLACED!</b>
@@ -275,7 +282,7 @@ Your balance: {self.formatter.format_currency(manager.balance)}
                 )
             except:
                 pass
-                
+            
             # Notify previous bidder
             await self._notify_outbid_user(context, auction, manager, bid_amount)
             
@@ -288,25 +295,41 @@ Your balance: {self.formatter.format_currency(manager.balance)}
                 )
             except:
                 pass
+
+    async def _delete_message_after(self, message, seconds):
+        """Delete message after delay"""
+        await asyncio.sleep(seconds)
+        try:
+            await message.delete()
+        except:
+            pass
                 
     def _create_quick_bid_buttons(self, current_bid: int, auction_id: ObjectId) -> List[List[InlineKeyboardButton]]:
-        """Create enhanced quick bid buttons"""
+        """Create enhanced quick bid buttons with proper increment rules"""
         buttons = []
         
-        # Dynamic increments based on current bid
-        if current_bid < 10_000_000:
-            increments = [1_000_000, 2_000_000, 5_000_000]
-        elif current_bid < 50_000_000:
-            increments = [2_000_000, 5_000_000, 10_000_000]
+        if current_bid == 0:
+            # Base price button handled by auction message
+            return buttons
+        elif current_bid < 20_000_000:
+            # Only show +1M button
+            new_amount = current_bid + 1_000_000
+            button_text = f"{EMOJI_ICONS['bid']} Bid {new_amount // 1_000_000}M"
+            buttons.append([InlineKeyboardButton(button_text, callback_data=f"qbid_{auction_id}_{new_amount}")])
         else:
-            increments = [5_000_000, 10_000_000, 20_000_000]
+            # Dynamic increments based on current bid
+            if current_bid < 50_000_000:
+                increments = [1_000_000, 2_000_000, 5_000_000]
+            elif current_bid < 100_000_000:
+                increments = [2_000_000, 5_000_000, 10_000_000]
+            else:
+                increments = [5_000_000, 10_000_000, 20_000_000]
             
-        for increment in increments:
-            new_amount = current_bid + increment
-            button_text = f"{EMOJI_ICONS['bid']} +{increment // 1_000_000}M ({new_amount // 1_000_000}M)"
-            callback_data = f"qbid_{auction_id}_{new_amount}"
-            buttons.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
-            
+            for increment in increments:
+                new_amount = current_bid + increment
+                button_text = f"{EMOJI_ICONS['bid']} +{increment // 1_000_000}M ({new_amount // 1_000_000}M)"
+                buttons.append([InlineKeyboardButton(button_text, callback_data=f"qbid_{auction_id}_{new_amount}")])
+        
         return buttons
         
     async def _notify_outbid_user(self, context, auction, new_leader, new_bid):
@@ -458,60 +481,56 @@ Your balance: {self.formatter.format_currency(manager.balance)}
             return 0.0
         return (auctions_won / total_bids) * 100
         
-    async def show_my_team(self, update, context, manager: Optional[Manager] = None):
-        """Show user's team with formation"""
-        query = update.callback_query if hasattr(update, 'callback_query') else None
-        user_id = query.from_user.id if query else update.effective_user.id
+    async def show_my_team(self, query, context, manager: Optional[Manager] = None):
+        """Show user's team - fixed version"""
+        user_id = query.from_user.id
         
         if not manager:
             manager = await self.db.get_manager(user_id)
-            
+        
         if not manager:
-            text = f"{EMOJI_ICONS['error']} You are not registered!"
-            if query:
-                await query.answer(text, show_alert=True)
-            else:
-                await update.message.reply_text(text)
+            await query.answer("You are not registered!", show_alert=True)
             return
-            
+        
         # Create team display
         if not manager.players:
             team_msg = f"""
-{EMOJI_ICONS['team']} <b>MY TEAM</b>
+    {EMOJI_ICONS['team']} <b>MY TEAM</b>
 
-{EMOJI_ICONS['info']} You haven't bought any players yet!
+    {EMOJI_ICONS['info']} You haven't bought any players yet!
 
-Start bidding in auctions to build your dream team.
+    Start bidding in auctions to build your dream team.
 
-{EMOJI_ICONS['target']} <b>Tips:</b>
-• Focus on key positions first
-• Balance your spending
-• Watch for bargain deals
+    {EMOJI_ICONS['target']} <b>Tips:</b>
+    - Focus on key positions first
+    - Balance your spending
+    - Watch for bargain deals
             """.strip()
         else:
             # Get team rating
             team_rating = self._calculate_team_rating(manager)
-            completion = (len(manager.players) / 11) * 100
             
             team_msg = f"""
-{EMOJI_ICONS['team']} <b>MY TEAM</b>
+    {EMOJI_ICONS['team']} <b>MY TEAM</b>
 
-{EMOJI_ICONS['user']} <b>Manager:</b> {manager.name}
-{EMOJI_ICONS['player']} <b>Squad Size:</b> {len(manager.players)}/11
-{EMOJI_ICONS['chart']} <b>Completion:</b> {completion:.0f}%
-{EMOJI_ICONS['star']} <b>Team Rating:</b> {team_rating}★
+    {EMOJI_ICONS['user']} <b>Manager:</b> {manager.name}
+    {EMOJI_ICONS['player']} <b>Squad Size:</b> {len(manager.players)}
+    {EMOJI_ICONS['star']} <b>Team Rating:</b> {team_rating}★
 
-{EMOJI_ICONS['trophy']} <b>Players:</b>
+    {EMOJI_ICONS['trophy']} <b>Players:</b>
             """.strip()
             
-            # Group by position if available and show players
+            # Show all players with proper formatting
             for i, player in enumerate(manager.players, 1):
-                team_msg += f"\n{i}. {player}"
-                
-            # Add formation suggestion if team is getting full
-            if len(manager.players) >= 8:
-                team_msg += f"\n\n{EMOJI_ICONS['lightbulb']} <b>Suggested Formation:</b> 4-3-3"
-                
+                if isinstance(player, dict):
+                    # If player is stored as dict with details
+                    player_name = player.get('name', 'Unknown')
+                    player_price = player.get('price', 0)
+                    team_msg += f"\n{i}. {player_name} - {self.formatter.format_currency(player_price)}"
+                else:
+                    # If player is stored as string
+                    team_msg += f"\n{i}. {player}"
+        
         keyboard = [
             [
                 InlineKeyboardButton(f"{EMOJI_ICONS['money']} Balance", callback_data="check_balance"),
@@ -520,18 +539,15 @@ Start bidding in auctions to build your dream team.
             [InlineKeyboardButton(f"{EMOJI_ICONS['loading']} Refresh", callback_data="my_team")]
         ]
         
-        if query:
+        try:
             await query.edit_message_text(
                 team_msg,
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
-        else:
-            await update.message.reply_text(
-                team_msg,
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
+        except Exception as e:
+            logger.error(f"Error showing team: {e}")
+            await query.answer("Error displaying team. Please try again.", show_alert=True)
             
     def _calculate_team_rating(self, manager: Manager) -> float:
         """Calculate team rating based on spending and player count"""
@@ -553,10 +569,8 @@ Start bidding in auctions to build your dream team.
         else:
             price_rating = 3.0
             
-        # Bonus for team completion
-        completion_bonus = (len(manager.players) / 11) * 0.5
-        
-        return min(5.0, price_rating + completion_bonus)
+        # No bonus for team completion anymore
+        return min(5.0, price_rating)
             
     async def show_detailed_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show detailed user statistics"""
@@ -783,7 +797,7 @@ Start bidding in auctions to build your dream team.
             'win_auction': "Win your first auction",
             'bid_warrior': f"Win 10 auctions (Current: {manager.statistics.get('auctions_won', 0)}/10)",
             'big_spender': f"Spend over 100M total (Current: {self.formatter.format_currency(manager.total_spent)})",
-            'perfect_team': f"Build a team of 11 players (Current: {len(manager.players)}/11)",
+            'perfect_team': f"Build a team with many players (Current: {len(manager.players)})",
             'auction_master': f"Win 50 auctions (Current: {manager.statistics.get('auctions_won', 0)}/50)",
             'speed_bidder': "Place 5 bids within 1 minute",
             'bargain_hunter': "Win 5 players at their base price",
@@ -857,32 +871,25 @@ Start bidding in auctions to build your dream team.
             
             await self.db.update_auction_bid(current_auction._id, bid)
             
+            # Notify admin handlers to reset timer
+            if self.admin_handlers:
+                await self.admin_handlers.handle_new_bid(current_auction._id, user_id, amount, context)
+            
             # Answer callback
             await query.answer(
                 f"{EMOJI_ICONS['success']} Bid placed: {self.formatter.format_currency(amount)}!"
             )
             
-            # Update message with new bid info
-            bid_msg = self.formatter.format_new_bid(
-                current_auction.player_name,
-                manager.name,
-                amount
-            )
-            
-            # Create new buttons
-            keyboard = self._create_quick_bid_buttons(amount, current_auction._id)
-            
+            # Send quick confirmation animation/sticker
             try:
-                await query.edit_message_text(
-                    bid_msg,
-                    parse_mode='HTML',
-                    reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+                await context.bot.send_sticker(
+                    AUCTION_GROUP_ID,
+                    sticker="CAACAgIAAxkBAAEBPQRhXoX5AAF5kgABQKN5AAH5yQ8AAgMAA8A2TxP5al-2ZdafVyEE"  # Success sticker
                 )
-            except BadRequest:
-                # Message was not modified or another error
+            except:
                 pass
                 
-            # Send confirmation
+            # Send confirmation to bidder
             if ENABLE_DM_NOTIFICATIONS:
                 try:
                     await context.bot.send_message(

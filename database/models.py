@@ -23,10 +23,11 @@ class ManagerRole(Enum):
 @dataclass
 class Manager:
     user_id: int
-    name: str
+    name: str  # This will be the display name
     username: Optional[str] = None
+    team_name: Optional[str] = None  # Add team name field
     balance: int = DEFAULT_BALANCE
-    players: List[str] = field(default_factory=list)
+    players: List[Dict[str, Any]] = field(default_factory=list)  # Change to store player details
     total_spent: int = 0
     role: str = ManagerRole.USER.value
     achievements: List[str] = field(default_factory=list)
@@ -35,8 +36,12 @@ class Manager:
     last_active: datetime = field(default_factory=datetime.now)
     is_banned: bool = False
     ban_reason: Optional[str] = None
+    banned_by: Optional[int] = None
+    banned_at: Optional[datetime] = None
+    last_balance_reset: Optional[datetime] = None
+    reset_by: Optional[int] = None
     preferences: Dict[str, Any] = field(default_factory=dict)
-    _id: Optional[ObjectId] = None  # Add this to handle MongoDB _id
+    _id: Optional[ObjectId] = None
     
     def __post_init__(self):
         if not self.statistics:
@@ -61,6 +66,7 @@ class Manager:
             'user_id': self.user_id,
             'name': self.name,
             'username': self.username,
+            'team_name': self.team_name,
             'balance': self.balance,
             'players': self.players,
             'total_spent': self.total_spent,
@@ -348,3 +354,14 @@ class AuctionSession:
         if self._id:
             data['_id'] = self._id
         return data
+    
+@dataclass
+class Session:
+    start_time: datetime
+    admin_id: int
+    total_players: int
+    end_time: Optional[datetime] = None
+    players_sold: int = 0
+    players_unsold: int = 0
+    total_revenue: int = 0
+    _id: Optional[ObjectId] = None

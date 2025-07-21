@@ -1,4 +1,4 @@
-# handlers/callback_handlers.py - Complete Callback Query Handling
+# handlers/callback_handlers.py - Complete Fixed Callback Query Handling
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
@@ -13,11 +13,12 @@ from utilities.formatters import MessageFormatter
 logger = logging.getLogger(__name__)
 
 class CallbackHandlers:
-    def __init__(self, db, bot, admin_handlers, user_handlers):
+    def __init__(self, db, bot, admin_handlers, user_handlers, auction_handlers=None):
         self.db = db
         self.bot = bot
         self.admin_handlers = admin_handlers
         self.user_handlers = user_handlers
+        self.auction_handlers = auction_handlers
         self.formatter = MessageFormatter()
         
     async def handle_callback(self, query, context: ContextTypes.DEFAULT_TYPE):
@@ -42,10 +43,40 @@ class CallbackHandlers:
                 await self._handle_admin_groups(query, context)
             elif data == "admin_broadcast":
                 await self._handle_admin_broadcast_menu(query, context)
+            elif data == "create_broadcast":
+                await self._handle_create_broadcast(query, context)
             elif data == "view_managers":
                 await self._handle_view_managers(query, context)
             elif data == "view_analytics":
                 await self._handle_view_analytics(query, context)
+            elif data.startswith("approve_request_"):
+                await self._handle_approve_request(query, context, data)
+            elif data.startswith("reject_request_"):
+                await self._handle_reject_request(query, context, data)
+            elif data == "edit_managers_list":
+                await self._handle_edit_managers_list(query, context)
+            elif data.startswith("edit_manager_"):
+                await self._handle_edit_specific_manager(query, context, data)
+            elif data.startswith("edit_name_"):
+                await self._handle_edit_name_start(query, context, data)
+            elif data.startswith("edit_team_"):
+                await self._handle_edit_team_start(query, context, data)
+            elif data.startswith("edit_balance_"):
+                await self._handle_edit_balance_start(query, context, data)
+            # elif data.startswith("edit_manager_"):
+                # await self._handle_edit_manager_options(query, context, data)
+            # elif data.startswith("ban_manager_"):
+                # await self._handle_ban_manager(query, context, data)
+            # elif data.startswith("unban_manager_"):
+                # await self._handle_unban_manager(query, context, data)
+            elif data == "skip_break":
+                # Check if user is admin
+                if query.from_user.id not in ADMIN_IDS:
+                    await query.answer("⚠️ Admin access required!", show_alert=True)
+                    return
+                    
+                if self.admin_handlers:
+                    await self.admin_handlers.skip_break(query, context)
                 
             # Settings callbacks
             elif data.startswith("settings_"):
@@ -56,6 +87,8 @@ class CallbackHandlers:
                 await self._handle_mode_setting(query, context, data)
             elif data.startswith("budget_set_"):
                 await self._handle_budget_setting(query, context, data)
+            elif data.startswith("break_set_"):
+                await self._handle_break_setting(query, context, data)
             elif data == "analytics_toggle":
                 await self._handle_analytics_toggle(query, context)
             elif data.startswith("notification_"):
@@ -107,9 +140,19 @@ class CallbackHandlers:
             elif data.startswith("watch_auction_"):
                 await self._handle_watch_auction(query, context, data)
                 
+            # Auction flow callbacks
+            elif data == "skip_break":
+                await self._handle_skip_break(query, context)
+            elif data.startswith("undo_last_"):
+                await self._handle_undo_last_auction(query, context, data)
+            elif data.startswith("auction_summary_"):
+                await self._handle_auction_summary(query, context, data)
+                
             # Help callbacks
             elif data.endswith("_help"):
                 await self._handle_help_section(query, context, data)
+            elif data == "help_menu":
+                await self._handle_help_menu(query, context)
                 
             # General callbacks
             elif data == "start":
@@ -130,6 +173,22 @@ class CallbackHandlers:
                 await self._handle_set_group_type(query, context, data, "data")
             elif data.startswith("set_unsold_group_"):
                 await self._handle_set_group_type(query, context, data, "unsold")
+            elif data == "find_group_help":
+                await self._handle_find_group_help(query, context)
+            elif data == "list_all_groups":
+                await self._handle_list_all_groups(query, context)
+            elif data == "group_tools":
+                await self._handle_group_tools(query, context)
+                
+            # Reports and exports
+            elif data == "download_report":
+                await self._handle_download_report(query, context)
+            elif data == "session_full_report":
+                await self._handle_session_full_report(query, context)
+            elif data == "detailed_analytics":
+                await self._handle_detailed_analytics(query, context)
+            elif data == "export_analytics":
+                await self._handle_export_analytics(query, context)
                 
         except Exception as e:
             logger.error(f"Error handling callback {data}: {e}")
@@ -148,6 +207,7 @@ class CallbackHandlers:
         # Get current settings
         current_mode = await self.db.get_setting("auction_mode") or ("auto" if AUTO_MODE else "manual")
         current_timer = await self.db.get_setting("auction_timer") or AUCTION_TIMER
+        current_break = await self.db.get_setting("auction_break") or 30
         current_budget = await self.db.get_setting("default_balance") or DEFAULT_BALANCE
         analytics_enabled = await self.db.get_setting("track_analytics")
         if analytics_enabled is None:
@@ -168,7 +228,7 @@ class CallbackHandlers:
             ],
             [
                 InlineKeyboardButton("🎯 Session", callback_data="settings_session"),
-                InlineKeyboardButton("🏢 Groups", callback_data="settings_groups")
+                InlineKeyboardButton("⏸️ Break Timer", callback_data="settings_break")
             ],
             [InlineKeyboardButton("🔙 Back", callback_data="start")]
         ]
@@ -180,6 +240,7 @@ class CallbackHandlers:
 
 🎮 Mode: <b>{current_mode.upper()}</b>
 ⏰ Timer: <b>{current_timer}s</b>
+⏸️ Break: <b>{current_break}s</b>
 💰 Default Balance: <b>{self.formatter.format_currency(current_budget)}</b>
 📊 Analytics: <b>{'ON' if analytics_enabled else 'OFF'}</b>
 
@@ -205,7 +266,9 @@ Select a category to configure:
         groups = await self.db.get_all_groups()
         
         # Get analytics data
-        analytics = await self.admin_handlers.analytics.get_auction_analytics(days=7)
+        from utilities.analytics import AnalyticsManager
+        analytics_manager = AnalyticsManager(self.db)
+        analytics = await analytics_manager.get_auction_analytics(days=7)
         
         dashboard_msg = f"""
 {EMOJI_ICONS['chart']} <b>ADMIN DASHBOARD</b>
@@ -299,31 +362,35 @@ Timer: <b>{AUCTION_TIMER}s</b>
         source = data.replace("auction_from_", "")
         
         if source == "data":
-            # Get next player from data group
-            players = await self.db.get_available_players()
-            if not players:
-                await query.answer("No players available in data group!", show_alert=True)
-                return
-                
-            # Start auction with first player
-            player = players[0]
-            success = await self.admin_handlers._create_auction_from_player(query, context, player)
+            # Tell admin to use command
+            await query.edit_message_text(
+                f"{EMOJI_ICONS['info']} To start auction from data group:\n\n"
+                f"Use command: /start_auction\n\n"
+                f"This will load all available players and start the auction queue.",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Back", callback_data="start_auction_menu")
+                ]])
+            )
             
-            if success:
-                await query.answer("Auction started successfully!", show_alert=True)
-            else:
-                await query.answer("Failed to start auction!", show_alert=True)
-                
         elif source == "manual":
             await query.edit_message_text(
                 f"{EMOJI_ICONS['info']} Manual auction entry feature will be available soon!\n\n"
-                f"For now, use the data group method or /start_auction command."
+                f"For now, use the data group method or /start_auction command.",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Back", callback_data="start_auction_menu")
+                ]])
             )
             
         elif source == "saved":
             await query.edit_message_text(
                 f"{EMOJI_ICONS['info']} Saved players feature will be available soon!\n\n"
-                f"For now, use the data group method."
+                f"For now, use the data group method.",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Back", callback_data="start_auction_menu")
+                ]])
             )
             
     async def _handle_admin_groups(self, query, context):
@@ -359,8 +426,9 @@ Connected Groups: {len(groups)}
                 msg += f"\n{icon} {name}: ❌ Not configured"
                 
         keyboard.extend([
-            [InlineKeyboardButton("🔍 Find Group ID", callback_data="find_group_id")],
+            [InlineKeyboardButton("🔍 Find Group ID", callback_data="find_group_help")],
             [InlineKeyboardButton("📋 All Groups", callback_data="list_all_groups")],
+            [InlineKeyboardButton("🔧 Group Tools", callback_data="group_tools")],
             [InlineKeyboardButton("🔙 Back", callback_data="admin_dashboard")]
         ])
         
@@ -442,7 +510,9 @@ Create and manage broadcasts to all managers.
             return
             
         # Get analytics data
-        analytics = await self.admin_handlers.analytics.get_auction_analytics(days=7)
+        from utilities.analytics import AnalyticsManager
+        analytics_manager = AnalyticsManager(self.db)
+        analytics = await analytics_manager.get_auction_analytics(days=7)
         
         analytics_msg = f"""
 {EMOJI_ICONS['chart']} <b>ANALYTICS DASHBOARD</b>
@@ -510,35 +580,28 @@ Create and manage broadcasts to all managers.
             await self._show_session_settings(query, context)
         elif setting == "groups":
             await self._handle_admin_groups(query, context)
+        elif setting == "break":
+            await self._show_break_settings(query, context)
             
     async def _show_manager_settings(self, query, context):
         """Show manager management settings"""
-        managers = await self.db.get_all_managers()
+        managers = await self.db.get_all_managers(include_banned=True)
         banned_count = len([m for m in managers if m.is_banned])
         
         msg = f"""
-{EMOJI_ICONS['team']} <b>MANAGER SETTINGS</b>
+    {EMOJI_ICONS['team']} <b>MANAGER SETTINGS</b>
 
-Total Managers: {len(managers)}
-Banned: {banned_count}
+    Total Managers: {len(managers)}
+    Banned: {banned_count}
 
-{EMOJI_ICONS['info']} <b>Points System:</b>
-Points are earned through:
-• Placing bids: +1 point
-• Winning auctions: +10 points
-• Achievements: Variable points
-• Daily participation: +5 points
-
-Points determine manager levels and unlock achievements.
-
-Select an action:
+    Select an action:
         """.strip()
         
         keyboard = [
             [InlineKeyboardButton("➕ Add Manager", callback_data="add_manager_menu")],
-            [InlineKeyboardButton("📋 List Managers", callback_data="view_managers")],
+            [InlineKeyboardButton("📝 Edit Managers", callback_data="edit_managers_list")],
             [InlineKeyboardButton("🔄 Reset Balances", callback_data="reset_balances")],
-            [InlineKeyboardButton("🚫 Ban Manager", callback_data="ban_manager_menu")],
+            [InlineKeyboardButton("🚫 Ban/Unban", callback_data="ban_manager_menu")],
             [InlineKeyboardButton("🗑️ Remove All", callback_data="remove_all_managers")],
             [InlineKeyboardButton("🔙 Back", callback_data="admin_settings")]
         ]
@@ -559,6 +622,7 @@ Select an action:
 Current Timer: <b>{current_timer} seconds</b>
 
 {EMOJI_ICONS['info']} Timer determines how long auctions run in AUTO mode.
+Timer resets on each new bid.
 
 Select a timer duration:
         """.strip()
@@ -573,6 +637,40 @@ Select a timer duration:
                 InlineKeyboardButton("90s", callback_data="timer_set_90"),
                 InlineKeyboardButton("120s", callback_data="timer_set_120"),
                 InlineKeyboardButton("180s", callback_data="timer_set_180")
+            ],
+            [InlineKeyboardButton("🔙 Back", callback_data="admin_settings")]
+        ]
+        
+        await query.edit_message_text(
+            msg,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+    async def _show_break_settings(self, query, context):
+        """Show break timer settings"""
+        current_break = await self.db.get_setting("auction_break") or 30
+        
+        msg = f"""
+{EMOJI_ICONS['clock']} <b>BREAK TIMER SETTINGS</b>
+
+Current Break Timer: <b>{current_break} seconds</b>
+
+{EMOJI_ICONS['info']} Break timer determines the pause between auctions.
+
+Select a break duration:
+        """.strip()
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("⚡ Quick (10s)", callback_data="break_set_10"),
+                InlineKeyboardButton("⏱️ 20s", callback_data="break_set_20"),
+                InlineKeyboardButton("⏰ 30s", callback_data="break_set_30")
+            ],
+            [
+                InlineKeyboardButton("⏳ 40s", callback_data="break_set_40"),
+                InlineKeyboardButton("⌛ 60s", callback_data="break_set_60"),
+                InlineKeyboardButton("🐌 90s", callback_data="break_set_90")
             ],
             [InlineKeyboardButton("🔙 Back", callback_data="admin_settings")]
         ]
@@ -598,6 +696,18 @@ Select a timer duration:
         
         await query.answer(f"✅ Timer set to {timer_value} seconds!", show_alert=True)
         await self._show_timer_settings(query, context)
+        
+    async def _handle_break_setting(self, query, context, data):
+        """Handle break timer setting change"""
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("Admin access required!", show_alert=True)
+            return
+            
+        break_value = int(data.replace("break_set_", ""))
+        await self.db.set_setting("auction_break", break_value)
+        
+        await query.answer(f"✅ Break timer set to {break_value} seconds!", show_alert=True)
+        await self._show_break_settings(query, context)
         
     async def _show_mode_settings(self, query, context):
         """Show auction mode settings"""
@@ -906,7 +1016,9 @@ Sessions help organize and track auction events:
                 await query.answer("No active session to report on!", show_alert=True)
                 return
                 
-            report = await self.admin_handlers.analytics.generate_session_report(current['session_id'])
+            from utilities.analytics import AnalyticsManager
+            analytics_manager = AnalyticsManager(self.db)
+            report = await analytics_manager.generate_session_report(current['session_id'])
             
             report_msg = f"""
 {EMOJI_ICONS['chart']} <b>SESSION REPORT</b>
@@ -938,7 +1050,7 @@ Sessions help organize and track auction events:
                 ]])
             )
             
-    # Manager management handlers
+    # Manager management handlers (continue in next part...)
     async def _handle_add_manager_menu(self, query, context):
         """Handle add manager menu"""
         if query.from_user.id not in ADMIN_IDS:
@@ -1024,7 +1136,7 @@ Are you sure?
             await query.answer("Admin access required!", show_alert=True)
             return
             
-        managers = await self.db.get_all_managers()
+        managers = await self.db.get_all_managers(include_banned=True)
         active_managers = [m for m in managers if not m.is_banned]
         banned_managers = [m for m in managers if m.is_banned]
         
@@ -1171,21 +1283,23 @@ Are you absolutely sure?
             return
             
         # Remove all managers except admins
-        result = await self.db.managers.delete_many({
-            "user_id": {"$nin": ADMIN_IDS}
-        })
+        result = await self.db.remove_all_managers(query.from_user.id)
         
-        await query.answer(f"✅ Removed {result.deleted_count} managers!", show_alert=True)
+        await query.answer(f"✅ Removed {result} managers!", show_alert=True)
         
         await query.edit_message_text(
             f"{EMOJI_ICONS['success']} <b>MANAGERS REMOVED</b>\n\n"
             f"All non-admin managers have been removed.\n"
-            f"Deleted: {result.deleted_count} accounts",
+            f"Deleted: {result} accounts",
             parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔙 Back", callback_data="settings_managers")
             ]])
         )
+        
+    async def _handle_remove_manager(self, query, context, data):
+        """Remove specific manager - not implemented yet"""
+        await query.answer("Feature coming soon!", show_alert=True)
         
     # User callback handlers
     async def _handle_check_balance(self, query, context):
@@ -1363,91 +1477,228 @@ Are you absolutely sure?
             return
             
         auction_id = parts[1]
-        amount = int(parts[2])
+        try:
+            amount = int(parts[2])
+        except ValueError:
+            await query.answer("Invalid bid amount!", show_alert=True)
+            return
         
+        # Ensure user_handlers is available
         if self.user_handlers:
             await self.user_handlers.handle_quick_bid(query, context, auction_id, amount)
+        else:
+            logger.error("User handlers not available for quick bid")
+            await query.answer("Error processing bid!", show_alert=True)
             
-    async def _handle_request_access(self, query, context):
-        """Handle access request"""
-        user_id = query.from_user.id
-        user_name = query.from_user.full_name
-        username = query.from_user.username
+    async def _handle_auction_stats(self, query, context, data):
+        """Handle auction statistics request"""
+        auction_id = data.replace("auction_stats_", "")
         
-        # Check if already registered
-        manager = await self.db.get_manager(user_id)
-        if manager:
-            await query.answer("You're already registered!", show_alert=True)
+        if self.auction_handlers:
+            stats_msg = await self.auction_handlers.show_auction_statistics(auction_id, context)
+            await query.answer(stats_msg[:200], show_alert=True)  # Show first 200 chars in alert
+            
+    async def _handle_watch_auction(self, query, context, data):
+        """Handle watch auction request"""
+        auction_id = data.replace("watch_auction_", "")
+        
+        if self.auction_handlers:
+            success = await self.auction_handlers.handle_watch_auction(query.from_user.id, auction_id)
+            if success:
+                await query.answer("✅ You'll be notified about this auction!", show_alert=True)
+            else:
+                await query.answer("❌ Failed to add to watch list!", show_alert=True)
+                
+    async def _handle_skip_break(self, query, context):
+        """Handle skip break callback"""
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("Admin access required!", show_alert=True)
             return
             
-        # Add to join requests
-        request_data = {
-            'user_id': user_id,
-            'user_name': user_name,
-            'username': username,
-            'chat_id': query.message.chat.id
-        }
+        if self.admin_handlers:
+            await self.admin_handlers.skip_break(query, context)
+            
+    async def _handle_undo_last_auction(self, query, context, data):
+        """Handle undo last auction"""
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("Admin access required!", show_alert=True)
+            return
+            
+        auction_id = data.replace("undo_last_", "")
         
-        await self.db.add_join_request(request_data)
+        try:
+            # Get auction details
+            auction = await self.db.auctions.find_one({"_id": ObjectId(auction_id)})
+            if not auction:
+                await query.answer("Auction not found!", show_alert=True)
+                return
+                
+            # TODO: Implement actual undo logic
+            await query.answer("Undo feature coming soon!", show_alert=True)
+            
+        except Exception as e:
+            logger.error(f"Error handling undo: {e}")
+            await query.answer("Error processing undo!", show_alert=True)
+            
+    async def _handle_auction_summary(self, query, context, data):
+        """Show auction summary"""
+        auction_id = data.replace("auction_summary_", "")
+        
+        try:
+            # Get auction details
+            auction = await self.db.auctions.find_one({"_id": ObjectId(auction_id)})
+            if not auction:
+                await query.answer("Auction not found!", show_alert=True)
+                return
+                
+            # Get statistics
+            total_bids = len(auction.get('bids', []))
+            unique_bidders = len(set(bid['user_id'] for bid in auction.get('bids', [])))
+            duration = (auction.get('end_time', datetime.now()) - auction['start_time']).seconds
+            
+            summary_msg = f"""
+{EMOJI_ICONS['chart']} <b>AUCTION SUMMARY</b>
+
+{EMOJI_ICONS['player']} <b>Player:</b> {auction['player_name']}
+{EMOJI_ICONS['money']} <b>Base Price:</b> {self.formatter.format_currency(auction['base_price'])}
+{EMOJI_ICONS['chart_up']} <b>Final Price:</b> {self.formatter.format_currency(auction['current_bid'])}
+{EMOJI_ICONS['chart']} <b>Increase:</b> {((auction['current_bid'] - auction['base_price']) / auction['base_price'] * 100):.1f}%
+
+{EMOJI_ICONS['stats']} <b>Statistics:</b>
+• Total Bids: {total_bids}
+• Unique Bidders: {unique_bidders}
+• Duration: {duration}s
+• Avg Bid Interval: {duration / total_bids if total_bids else 0:.1f}s
+
+{EMOJI_ICONS['crown']} <b>Winner:</b> Check auction group
+            """.strip()
+            
+            keyboard = [[InlineKeyboardButton("🔙 Close", callback_data="cancel")]]
+            
+            await query.edit_message_text(
+                summary_msg,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        except Exception as e:
+            logger.error(f"Error showing auction summary: {e}")
+            await query.answer("Error loading summary!", show_alert=True)
+            
+    async def _handle_help_section(self, query, context, data):
+        """Handle help section callbacks"""
+        section = data.replace("_help", "")
+        help_content = HELP_SECTIONS.get(section, {})
+        
+        if not help_content:
+            await query.answer("Help section not found!", show_alert=True)
+            return
+            
+        msg = f"""
+{EMOJI_ICONS['info']} <b>{help_content.get('title', 'Help')}</b>
+
+{help_content.get('description', '')}
+        """.strip()
+        
+        # Add content based on section type
+        if section == 'basic':
+            for cmd in help_content.get('commands', []):
+                msg += f"\n• {cmd}"
+        elif section == 'bidding':
+            for content in help_content.get('content', []):
+                msg += f"\n• {content}"
+        elif section == 'strategy':
+            for tip in help_content.get('tips', []):
+                msg += f"\n• {tip}"
+        elif section == 'rules':
+            for rule in help_content.get('rules', []):
+                msg += f"\n• {rule}"
+        elif section == 'faq':
+            for item in help_content.get('items', []):
+                msg += f"\n\n❓ <b>{item['question']}</b>"
+                msg += f"\n{item['answer']}"
+                
+        keyboard = [[InlineKeyboardButton("🔙 Back to Help", callback_data="help_menu")]]
         
         await query.edit_message_text(
-            f"{EMOJI_ICONS['success']} <b>REQUEST SUBMITTED</b>\n\n"
-            f"Your access request has been sent to the admins.\n"
-            f"You'll be notified once it's processed.\n\n"
-            f"{EMOJI_ICONS['clock']} Please wait for approval.",
+            msg,
             parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 Back", callback_data="start")
-            ]])
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         
-        # Notify admins
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(
-                    admin_id,
-                    f"{EMOJI_ICONS['bell']} <b>NEW ACCESS REQUEST</b>\n\n"
-                    f"{EMOJI_ICONS['user']} Name: {user_name}\n"
-                    f"{EMOJI_ICONS['id']} ID: <code>{user_id}</code>\n"
-                    f"{EMOJI_ICONS['at']} Username: @{username or 'None'}\n\n"
-                    f"Use /settings → Managers to approve/reject.",
-                    parse_mode='HTML'
-                )
-            except:
-                pass
+    async def _handle_help_menu(self, query, context):
+        """Show help menu"""
+        help_sections = {
+            "basic_help": "📚 Basic Commands",
+            "bidding_help": "🎯 Bidding Guide",
+            "strategy_help": "🧠 Strategy Tips",
+            "rules_help": "📜 Auction Rules",
+            "faq_help": "❓ FAQ"
+        }
+        
+        keyboard = [[InlineKeyboardButton(text, callback_data=data)] 
+                   for data, text in help_sections.items()]
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="start")])
+        
+        help_msg = """
+🆘 <b>EFOOTBALL AUCTION HELP CENTER</b>
+
+Welcome to the ultimate auction experience! Select a topic below to learn more:
+
+🎮 <b>Quick Tips:</b>
+• React fast - auctions move quickly!
+• Watch your balance - plan your bids
+• Build a balanced team
+• Use quick bid buttons for speed
+
+Select a help topic below:
+        """.strip()
+        
+        await query.edit_message_text(
+            help_msg,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+        
+    async def handle_request_access(self, query, context):
+        """Handle access request - redirect to conversation"""
+        # This will be handled by the conversation handler in bot.py
+        # The conversation handler will take over from here
+        await self._start_access_request_conversation(query, context)
                 
     async def _handle_about(self, query, context):
         """Handle about bot callback"""
-        uptime = datetime.now() - query.message.date if hasattr(query.message, 'date') else timedelta(0)
-        hours = int(uptime.total_seconds() // 3600)
-        minutes = int((uptime.total_seconds() % 3600) // 60)
-        
         about_msg = f"""
-🤖 <b>EFOOTBALL AUCTION BOT v2.0</b>
+🤖 <b>EFOOTBALL AUCTION BOT</b>
 
-<b>🎮 Features:</b>
+<b>🎮 What is this bot?</b>
+A sophisticated auction system for eFootball leagues where managers bid on players in real-time auctions.
+
+<b>⚡ Key Features:</b>
 - Real-time player auctions
-- Visual countdown timers
-- Advanced analytics
-- Team management
-- Achievements & rewards
+- Visual countdown timers  
+- Balance management
+- Team building
+- Achievement system
 - Live leaderboards
 
-<b>⚡ Performance:</b>
-- Response time: <50ms
-- 99.9% reliability
-- 24/7 availability
+<b>🎯 How to participate:</b>
+1. Get registered by an admin
+2. Receive starting balance
+3. Bid on players during auctions
+4. Build your dream team!
 
-<b>👨‍💻 Developed by:</b> @YourUsername
-<b>🌟 Version:</b> 2.0.0
-<b>📅 Last Update:</b> {datetime.now().strftime('%Y-%m-%d')}
+<b>💡 Tips:</b>
+- Plan your budget wisely
+- Watch for bargain deals
+- React quickly in auctions
+- Build a balanced squad
 
-<i>Making auctions exciting since 2025!</i>
+<i>Making auctions exciting!</i>
         """.strip()
         
         keyboard = [
-            [InlineKeyboardButton("🌐 Website", url="https://yourwebsite.com")],
-            [InlineKeyboardButton("💬 Support", url="https://t.me/yoursupport")],
+            [InlineKeyboardButton("📝 Request Access", callback_data="request_access")],
             [InlineKeyboardButton("🔙 Back", callback_data="start")]
         ]
         
@@ -1492,10 +1743,6 @@ Ready to play? Join the auction group!
         
     async def _handle_start(self, query, context):
         """Handle start callback - redirect to main start function"""
-        # Create a fake update for the start command
-        from telegram import Message, Chat, User
-        
-        # Create the start command again
         user_id = query.from_user.id
         user_name = query.from_user.full_name
         
@@ -1554,13 +1801,460 @@ Ready to play? Join the auction group!
             parse_mode='HTML'
         )
         
+    # Group management handlers
+    async def _handle_manage_group(self, query, context, data):
+        """Handle manage group callback"""
+        await query.answer("Group management feature coming soon!", show_alert=True)
+        
+    async def _handle_set_group_type(self, query, context, data, group_type):
+        """Handle set group type callback"""
+        await query.answer("Group configuration feature coming soon!", show_alert=True)
+        
+    async def _handle_find_group_help(self, query, context):
+        """Show help for finding group IDs"""
+        help_msg = f"""
+{EMOJI_ICONS['info']} <b>HOW TO FIND GROUP ID</b>
+
+There are several ways to get a group's ID:
+
+1️⃣ <b>Using @userinfobot:</b>
+• Add @userinfobot to your group
+• It will show the group ID
+• For supergroups: -100xxxxxxxxxx
+
+2️⃣ <b>Using @getidsbot:</b>
+• Add @getidsbot to your group
+• Send /start in the group
+• It will show all IDs
+
+3️⃣ <b>From invite links:</b>
+• Get the group's invite link
+• The numbers after t.me/c/ are the ID
+• Add -100 prefix for supergroups
+
+{EMOJI_ICONS['warning']} <b>Important:</b>
+• Bot must be added to the group
+• Bot needs admin rights for full features
+        """.strip()
+        
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin_groups")]]
+        
+        await query.edit_message_text(
+            help_msg,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+    async def _handle_list_all_groups(self, query, context):
+        """List all connected groups"""
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("Admin access required!", show_alert=True)
+            return
+            
+        groups = await self.db.get_all_groups()
+        
+        if not groups:
+            await query.edit_message_text(
+                f"{EMOJI_ICONS['info']} No groups connected yet!",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Back", callback_data="admin_groups")
+                ]])
+            )
+            return
+            
+        msg = f"{EMOJI_ICONS['home']} <b>ALL CONNECTED GROUPS</b>\n\n"
+        
+        for i, group in enumerate(groups, 1):
+            status = "🟢" if group['status'] == 'active' else "🔴"
+            msg += f"{i}. {status} <b>{group['title']}</b>\n"
+            msg += f"   ID: <code>{group['chat_id']}</code>\n"
+            msg += f"   Type: {group['type']}\n"
+            msg += f"   Added: {group['added_at'].strftime('%Y-%m-%d')}\n\n"
+            
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin_groups")]]
+        
+        await query.edit_message_text(
+            msg,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+    async def _handle_group_tools(self, query, context):
+        """Show group management tools"""
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("Admin access required!", show_alert=True)
+            return
+            
+        msg = f"""
+{EMOJI_ICONS['gear']} <b>GROUP TOOLS</b>
+
+Manage your auction groups:
+
+{EMOJI_ICONS['info']} <b>Available Actions:</b>
+• Test group connectivity
+• Update group settings
+• Assign group roles
+• Export group data
+        """.strip()
+        
+        keyboard = [
+            [InlineKeyboardButton("🔍 Test Groups", callback_data="test_groups")],
+            [InlineKeyboardButton("📋 Export Config", callback_data="export_group_config")],
+            [InlineKeyboardButton("🔙 Back", callback_data="admin_groups")]
+        ]
+        
+        await query.edit_message_text(
+            msg,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+    # Report handlers
+    async def _handle_download_report(self, query, context):
+        """Handle report download request"""
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("Admin access required!", show_alert=True)
+            return
+            
+        await query.answer("Report generation feature coming soon!", show_alert=True)
+        
+    async def _handle_session_full_report(self, query, context):
+        """Show full session report"""
+        if self.admin_handlers and self.admin_handlers.current_session:
+            from utilities.analytics import AnalyticsManager
+            analytics_manager = AnalyticsManager(self.db)
+            report = await analytics_manager.generate_session_report(self.admin_handlers.current_session)
+            
+            # Format detailed report
+            msg = f"""
+{EMOJI_ICONS['chart']} <b>DETAILED SESSION REPORT</b>
+
+{EMOJI_ICONS['calendar']} <b>Session Info:</b>
+• ID: {report.get('session_id', 'N/A')}
+• Duration: {report.get('duration', 'N/A')}
+
+{EMOJI_ICONS['stats']} <b>Auction Statistics:</b>
+• Total Auctions: {report.get('total_auctions', 0)}
+• Sold Players: {report.get('sold_players', 0)}
+• Unsold Players: {report.get('unsold_players', 0)}
+• Success Rate: {(report.get('sold_players', 0) / report.get('total_auctions', 1) * 100):.1f}%
+
+{EMOJI_ICONS['money']} <b>Financial Summary:</b>
+• Total Revenue: {self.formatter.format_currency(report.get('total_revenue', 0))}
+• Average Sale: {self.formatter.format_currency(report.get('total_revenue', 0) / max(report.get('sold_players', 1), 1))}
+
+{EMOJI_ICONS['trophy']} <b>Top 5 Managers:</b>
+            """.strip()
+            
+            # Add top managers
+            for i, manager in enumerate(report.get('manager_rankings', [])[:5], 1):
+                medal = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'][i-1]
+                msg += f"\n{medal} {manager['name']} - {self.formatter.format_currency(manager['total_spent'])}"
+                
+            keyboard = [
+                [InlineKeyboardButton("📊 Export CSV", callback_data="export_session_csv")],
+                [InlineKeyboardButton("🔙 Close", callback_data="cancel")]
+            ]
+            
+            await query.edit_message_text(
+                msg,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await query.answer("No active session found!", show_alert=True)
+            
+    async def _handle_detailed_analytics(self, query, context):
+        """Show detailed analytics"""
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("Admin access required!", show_alert=True)
+            return
+            
+        await query.answer("Detailed analytics feature coming soon!", show_alert=True)
+        
+    async def _handle_export_analytics(self, query, context):
+        """Handle analytics export"""
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("Admin access required!", show_alert=True)
+            return
+            
+        await query.answer("Export feature coming soon!", show_alert=True)
+        
+    async def _handle_create_broadcast(self, query, context):
+        """Handle create broadcast"""
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("Admin access required!", show_alert=True)
+            return
+            
+        await query.edit_message_text(
+            f"{EMOJI_ICONS['info']} <b>CREATE BROADCAST</b>\n\n"
+            f"Use the command /broadcast to send a message to all managers.\n\n"
+            f"Example:\n"
+            f"/broadcast Hello everyone! New auction starting soon!",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data="admin_broadcast")
+            ]])
+        )
+        
     # Helper methods
     def _get_uptime(self) -> str:
         """Get bot uptime"""
         try:
-            uptime = datetime.now() - datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-            hours = int(uptime.total_seconds() // 3600)
-            minutes = int((uptime.total_seconds() % 3600) // 60)
-            return f"{hours}h {minutes}m"
+            # This is a simplified version - you might want to track actual start time
+            return "Online"
         except:
             return "Unknown"
+
+    async def _handle_edit_managers_list(self, query, context):
+        """Show list of managers to edit"""
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("Admin access required!", show_alert=True)
+            return
+        
+        managers = await self.db.get_all_managers(include_banned=True)
+        
+        if not managers:
+            await query.edit_message_text(
+                f"{EMOJI_ICONS['error']} No managers found!",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Back", callback_data="settings_managers")
+                ]])
+            )
+            return
+        
+        msg = f"{EMOJI_ICONS['team']} <b>SELECT MANAGER TO EDIT</b>\n\n"
+        keyboard = []
+        
+        for manager in managers[:10]:  # Show first 10
+            btn_text = f"{manager.name}"
+            if manager.team_name:
+                btn_text += f" ({manager.team_name})"
+            if manager.is_banned:
+                btn_text = f"🚫 {btn_text}"
+            
+            keyboard.append([InlineKeyboardButton(
+                btn_text,
+                callback_data=f"edit_manager_{manager.user_id}"
+            )])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="settings_managers")])
+        
+        await query.edit_message_text(
+            msg,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def _handle_edit_specific_manager(self, query, context, data):
+        """Edit specific manager"""
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("Admin access required!", show_alert=True)
+            return
+        
+        user_id = int(data.replace("edit_manager_", ""))
+        manager = await self.db.get_manager(user_id)
+        
+        if not manager:
+            await query.answer("Manager not found!", show_alert=True)
+            return
+        
+        msg = f"""
+{EMOJI_ICONS['user']} <b>EDIT MANAGER</b>
+
+<b>Current Details:</b>
+Name: {manager.name}
+Team: {manager.team_name or 'Not set'}
+Username: @{manager.username or 'None'}
+Balance: {self.formatter.format_currency(manager.balance)}
+Players: {len(manager.players)}
+Status: {'🚫 Banned' if manager.is_banned else '✅ Active'}
+
+Select action:
+        """.strip()
+        
+        keyboard = [
+            [InlineKeyboardButton("✏️ Edit Name", callback_data=f"edit_name_{user_id}")],
+            [InlineKeyboardButton("🏢 Edit Team", callback_data=f"edit_team_{user_id}")],
+            [InlineKeyboardButton("💰 Edit Balance", callback_data=f"edit_balance_{user_id}")],
+        ]
+        
+        if manager.is_banned:
+            keyboard.append([InlineKeyboardButton("✅ Unban", callback_data=f"unban_manager_{user_id}")])
+        else:
+            keyboard.append([InlineKeyboardButton("🚫 Ban", callback_data=f"ban_manager_{user_id}")])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="edit_managers_list")])
+        
+        await query.edit_message_text(
+            msg,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def handle_approve_request(self, query, context, data):
+        """Handle request approval - redirect to conversation for team name"""
+        # This will be handled by the conversation handler in bot.py
+        # The conversation handler will take over from here
+        await self._start_approval_conversation(query, context)
+
+    async def _handle_reject_request(self, query, context, data):
+        """Reject access request"""
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("Admin access required!", show_alert=True)
+            return
+        
+        user_id = int(data.replace("reject_request_", ""))
+        
+        # Update request status
+        result = await self.db.join_requests.update_one(
+            {'user_id': user_id, 'status': 'pending'},
+            {'$set': {'status': 'rejected', 'processed_by': query.from_user.id}}
+        )
+        
+        if result.modified_count > 0:
+            # Update the message
+            await query.edit_message_text(
+                f"{EMOJI_ICONS['error']} <b>REQUEST REJECTED</b>\n\n"
+                f"{query.message.text}\n\n"
+                f"❌ Rejected by {query.from_user.full_name}",
+                parse_mode='HTML'
+            )
+            
+            # Notify the user
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    f"{EMOJI_ICONS['error']} <b>ACCESS DENIED</b>\n\n"
+                    f"Your access request has been rejected.\n"
+                    f"Please contact an admin for more information.",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            
+            await query.answer("❌ Request rejected!")
+        else:
+            await query.answer("Request not found!", show_alert=True)
+
+    async def _handle_edit_manager_options(self, query, context: ContextTypes.DEFAULT_TYPE, data: str):
+        """Show edit options for a manager"""
+        user_id = int(data.replace("edit_manager_", ""))
+        
+        manager = await self.db.get_manager(user_id)
+        if not manager:
+            await query.answer("Manager not found!", show_alert=True)
+            return
+            
+        # Store manager ID in context for later use
+        context.user_data['editing_manager_id'] = user_id
+        
+        keyboard = [
+            [InlineKeyboardButton("📝 Edit Name", callback_data=f"edit_name_{user_id}")],
+            [InlineKeyboardButton("🏆 Edit Team Name", callback_data=f"edit_team_{user_id}")],
+            [InlineKeyboardButton("💰 Edit Balance", callback_data=f"edit_balance_{user_id}")]
+        ]
+        
+        # Add ban/unban button
+        if manager.is_banned:
+            keyboard.append([InlineKeyboardButton("✅ Unban Manager", callback_data=f"unban_manager_{user_id}")])
+        else:
+            keyboard.append([InlineKeyboardButton("🚫 Ban Manager", callback_data=f"ban_manager_{user_id}")])
+            
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="edit_manager")])
+        
+        msg = f"""
+{EMOJI_ICONS['edit']} <b>EDIT MANAGER</b>
+
+👤 <b>Name:</b> {manager.name}
+🏆 <b>Team:</b> {manager.team_name or 'Not set'}
+💰 <b>Balance:</b> {self.formatter.format_currency(manager.balance)}
+🏆 <b>Players:</b> {len(manager.players)}
+🚫 <b>Status:</b> {'Banned' if manager.is_banned else 'Active'}
+
+Select what to edit:
+        """.strip()
+        
+        await query.edit_message_text(
+            msg,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def _handle_edit_name_start(self, query, context, data):
+        """Start edit name conversation"""
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("Admin access required!", show_alert=True)
+            return
+        
+        user_id = int(data.replace("edit_name_", ""))
+        manager = await self.db.get_manager(user_id)
+        
+        if not manager:
+            await query.answer("Manager not found!", show_alert=True)
+            return
+        
+        # Store in user_data for bot.py conversation handler
+        context.user_data['editing_user_id'] = user_id
+        context.user_data['edit_type'] = 'name'
+        context.user_data['edit_message_id'] = query.message.message_id
+        
+        await query.edit_message_text(
+            f"{EMOJI_ICONS['user']} <b>EDIT MANAGER NAME</b>\n\n"
+            f"Current name: {manager.name}\n\n"
+            f"Please type the new name:",
+            parse_mode='HTML'
+        )
+        
+        # Don't return state here - let bot.py handle it
+
+    async def _handle_edit_team_start(self, query, context, data):
+        """Start edit team conversation"""
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("Admin access required!", show_alert=True)
+            return
+        
+        user_id = int(data.replace("edit_team_", ""))
+        manager = await self.db.get_manager(user_id)
+        
+        if not manager:
+            await query.answer("Manager not found!", show_alert=True)
+            return
+        
+        # Store in user_data
+        context.user_data['editing_user_id'] = user_id
+        context.user_data['edit_type'] = 'team'
+        context.user_data['edit_message_id'] = query.message.message_id
+        
+        await query.edit_message_text(
+            f"{EMOJI_ICONS['team']} <b>EDIT TEAM NAME</b>\n\n"
+            f"Current team: {manager.team_name or 'Not set'}\n\n"
+            f"Please type the new team name (or 'none' to remove):",
+            parse_mode='HTML'
+        )
+
+    async def _handle_edit_balance_start(self, query, context, data):
+        """Start edit balance conversation"""
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("Admin access required!", show_alert=True)
+            return
+        
+        user_id = int(data.replace("edit_balance_", ""))
+        manager = await self.db.get_manager(user_id)
+        
+        if not manager:
+            await query.answer("Manager not found!", show_alert=True)
+            return
+        
+        # Store in user_data
+        context.user_data['editing_user_id'] = user_id
+        context.user_data['edit_type'] = 'balance'
+        context.user_data['edit_message_id'] = query.message.message_id
+        
+        await query.edit_message_text(
+            f"{EMOJI_ICONS['money']} <b>EDIT BALANCE</b>\n\n"
+            f"Current balance: {self.formatter.format_currency(manager.balance)}\n\n"
+            f"Please type the new balance amount:\n"
+            f"(Examples: 100 for 100M, 150.5 for 150.5M)",
+            parse_mode='HTML'
+        )

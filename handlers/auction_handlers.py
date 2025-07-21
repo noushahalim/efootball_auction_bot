@@ -1,8 +1,8 @@
-# handlers/auction_handlers.py - Specialized Auction Handling
+# handlers/auction_handlers.py - Specialized Auction Handling with Queue System
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List  # Added List import
+from typing import Optional, Dict, Any, List
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from bson import ObjectId
@@ -20,6 +20,11 @@ class AuctionHandlers:
         self.analytics = analytics
         self.formatter = MessageFormatter()
         self.active_extensions = {}  # Track auction extensions
+        self.auction_queue = []  # Queue of players to auction
+        self.current_session = None
+        self.break_timer_task = None
+        self.is_in_break = False
+        self.admin_handlers = None  # Will be set by admin_handlers
         
     async def handle_auction_extension(self, auction_id: ObjectId, context: ContextTypes.DEFAULT_TYPE):
         """Handle auction time extension on last-second bids"""
@@ -311,3 +316,186 @@ Last chance to bid!
             return None
             
         return recommended
+        
+    async def load_auction_queue(self) -> int:
+        """Load all available players into auction queue"""
+        try:
+            # Get all available players
+            players = await self.db.get_available_players()
+            
+            if not players:
+                logger.warning("No available players found for auction")
+                return 0
+                
+            # Clear existing queue
+            self.auction_queue = []
+            
+            # Load players into queue
+            for player in players:
+                self.auction_queue.append(player)
+                
+            logger.info(f"Loaded {len(self.auction_queue)} players into auction queue")
+            return len(self.auction_queue)
+            
+        except Exception as e:
+            logger.error(f"Error loading auction queue: {e}")
+            return 0
+            
+    async def get_next_player(self) -> Optional[Player]:
+        """Get next player from queue"""
+        if not self.auction_queue:
+            return None
+            
+        return self.auction_queue.pop(0)
+        
+    async def start_break_timer(self, context: ContextTypes.DEFAULT_TYPE, duration: int = None):
+        """Start break timer between auctions"""
+        try:
+            # Get break duration from settings or use default
+            if duration is None:
+                duration = await self.db.get_setting("auction_break") or AUCTION_BREAK
+                
+            self.is_in_break = True
+            logger.info(f"Starting break timer for {duration} seconds")
+            
+            # Send break message
+            break_msg = f"""
+{EMOJI_ICONS['clock']} <b>AUCTION BREAK</b>
+
+Next auction starts in {duration} seconds...
+
+{EMOJI_ICONS['info']} <i>Take a moment to plan your strategy!</i>
+            """.strip()
+            
+            # Get current mode
+            current_mode = await self.db.get_setting("auction_mode") or ("auto" if AUTO_MODE else "manual")
+            
+            keyboard = []
+            if current_mode == 'auto':
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"{EMOJI_ICONS['rocket']} Skip Break", 
+                        callback_data="skip_break"
+                    )
+                ])
+                
+            # Add undo button if there was a previous auction
+            last_auction = await self.db.auctions.find_one(
+                {"status": "completed"},
+                sort=[("end_time", -1)]
+            )
+            if last_auction and last_auction.get('current_bidder'):
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"{EMOJI_ICONS['undo']} Undo Last", 
+                        callback_data=f"undo_last_{last_auction['_id']}"
+                    )
+                ])
+                
+            reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+            
+            break_message = await context.bot.send_message(
+                AUCTION_GROUP_ID,
+                break_msg,
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+            
+            # Start countdown
+            async def break_countdown():
+                try:
+                    for i in range(duration, 0, -5):
+                        await asyncio.sleep(5)
+                        
+                        # Update break message
+                        try:
+                            break_msg_update = f"""
+{EMOJI_ICONS['clock']} <b>AUCTION BREAK</b>
+
+Next auction starts in {i-5} seconds...
+
+{EMOJI_ICONS['info']} <i>Take a moment to plan your strategy!</i>
+                            """.strip()
+                            
+                            await context.bot.edit_message_text(
+                                chat_id=AUCTION_GROUP_ID,
+                                message_id=break_message.message_id,
+                                text=break_msg_update,
+                                parse_mode='HTML',
+                                reply_markup=reply_markup
+                            )
+                        except:
+                            pass
+                            
+                    # Break finished
+                    self.is_in_break = False
+                    
+                    # Delete break message
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=AUCTION_GROUP_ID,
+                            message_id=break_message.message_id
+                        )
+                    except:
+                        pass
+                        
+                    # Check mode and continue
+                    if current_mode == 'auto' and self.auction_queue:
+                        # Auto mode - continue to next player
+                        if self.admin_handlers:
+                            await self.admin_handlers._process_next_in_queue(context)
+                    else:
+                        # Manual mode or no more players
+                        if not self.auction_queue:
+                            if self.admin_handlers:
+                                await self.admin_handlers._finish_auction_session(context)
+                        else:
+                            await context.bot.send_message(
+                                AUCTION_GROUP_ID,
+                                f"{EMOJI_ICONS['info']} Break finished. Admin can start next auction with /final_call",
+                                parse_mode='HTML'
+                            )
+                            
+                except asyncio.CancelledError:
+                    logger.info("Break timer cancelled")
+                    self.is_in_break = False
+                    
+            self.break_timer_task = asyncio.create_task(break_countdown())
+            
+        except Exception as e:
+            logger.error(f"Error starting break timer: {e}")
+            self.is_in_break = False
+            
+    async def skip_break(self):
+        """Skip the break timer"""
+        if self.break_timer_task:
+            self.break_timer_task.cancel()
+            self.is_in_break = False
+            logger.info("Break timer skipped")
+            
+    async def reset_auction_timer(self, auction_id: ObjectId, context: ContextTypes.DEFAULT_TYPE):
+        """Reset the auction timer (called on each new bid)"""
+        try:
+            # Get auction
+            auction = await self.db.auctions.find_one({"_id": auction_id})
+            if not auction or auction['status'] != 'active':
+                return
+                
+            # This is now handled by admin_handlers.handle_new_bid
+            # which calls gif_countdown.reset_timer
+            logger.info(f"Timer reset requested for auction {auction_id}")
+            
+        except Exception as e:
+            logger.error(f"Error resetting auction timer: {e}")
+            
+    def is_auction_in_break(self) -> bool:
+        """Check if auction system is in break"""
+        return self.is_in_break
+        
+    def get_queue_status(self) -> Dict[str, Any]:
+        """Get current queue status"""
+        return {
+            'players_remaining': len(self.auction_queue),
+            'in_break': self.is_in_break,
+            'current_session': self.current_session
+        }

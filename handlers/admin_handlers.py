@@ -1,4 +1,4 @@
-# handlers/admin_handlers.py - Complete Admin Handlers Implementation
+# handlers/admin_handlers.py - Fixed Admin Handlers with Complete Auction Flow...
 import asyncio
 import logging
 import re
@@ -14,6 +14,7 @@ from utilities.formatters import MessageFormatter
 from utilities.helpers import ValidationHelper
 from utilities.countdown import CountdownManager
 from utilities.analytics import AnalyticsManager
+from utilities.gif_countdown import GifCountdownManager
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +26,14 @@ class AdminHandlers:
         self.validator = ValidationHelper()
         self.countdown = CountdownManager()
         self.analytics = AnalyticsManager(db)
+        self.gif_countdown = GifCountdownManager(db)
+        self.auction_handlers = None  # Will be set by bot.py
+        self.callback_handlers = None  # Will be set by bot.py
         self.auction_tasks = {}
         self.current_session = None
+        self.auction_queue = []  # Queue of players to auction
+        self.break_timer_task = None  # Task for break between auctions
+        self.is_in_break = False  # Flag to track if we're in break period
         
     async def start_auction_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start_auction command with improved parsing"""
@@ -75,11 +82,12 @@ class AdminHandlers:
             # Start auction from specific message
             success = await self._start_auction_from_message(update, context, message_id)
         else:
-            # Start from next available player
-            success = await self._start_next_auction(update, context)
+            # Start from next available player and load queue
+            success = await self._start_auction_queue(update, context)
             
-    async def _start_next_auction(self, update, context):
-        """Start auction from next available player"""
+    async def _start_auction_queue(self, update, context):
+        """Start auction queue from available players"""
+        # Load all available players into queue
         players = await self.db.get_available_players()
         
         if not players:
@@ -89,9 +97,41 @@ class AdminHandlers:
             )
             return False
             
-        # Get first available player
-        player = players[0]
-        return await self._create_auction_from_player(update, context, player)
+        # Create or get current session
+        if not self.current_session:
+            session_name = f"Auction Session {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            session_id = await self.db.create_session(session_name)
+            self.current_session = session_id
+            
+        # Load players into queue
+        self.auction_queue = players
+        
+        await update.message.reply_text(
+            f"{EMOJI_ICONS['success']} <b>Auction Queue Loaded!</b>\n\n"
+            f"{EMOJI_ICONS['player']} Total Players: {len(players)}\n"
+            f"{EMOJI_ICONS['clock']} Starting first auction...",
+            parse_mode='HTML'
+        )
+        
+        # Start first auction
+        return await self._process_next_in_queue(context)
+        
+    async def _process_next_in_queue(self, context):
+        """Process next player in auction queue"""
+        if not self.auction_queue:
+            # Queue finished
+            await self._finish_auction_session(context)
+            return False
+            
+        # Get next player
+        player = self.auction_queue.pop(0)
+        
+        # Check if we need a break
+        if self.is_in_break:
+            return True  # Will be handled by break timer
+            
+        # Create and start auction
+        return await self._create_auction_from_player(None, context, player)
         
     async def _start_auction_from_message(self, update, context, message_id: int) -> bool:
         """Start auction from specific message ID"""
@@ -234,7 +274,7 @@ class AdminHandlers:
             auction = Auction(
                 player_name=player_data['name'],
                 base_price=player_data['base_price'],
-                current_bid=player_data['base_price'],
+                current_bid=0,
                 player_data=player_data,
                 mode=current_mode,
                 timer_duration=current_timer
@@ -247,60 +287,47 @@ class AdminHandlers:
             
             # Start timer if auto mode
             if current_mode == 'auto':
-                await self._start_auction_timer(auction_id, context)
+                await self._start_auction_timer(auction_id, current_timer, context)
                 
-            # Notify in admin chat
-            await update.message.reply_text(
-                f"{EMOJI_ICONS['success']} Auction started successfully!\n\n"
-                f"{EMOJI_ICONS['player']} Player: {player_data['name']}\n"
-                f"{EMOJI_ICONS['money']} Base: {self.formatter.format_currency(player_data['base_price'])}\n"
-                f"{EMOJI_ICONS['gear']} Mode: {current_mode.upper()}\n"
-                f"{EMOJI_ICONS['timer']} Timer: {current_timer}s"
-            )
+            # Notify in admin chat if update available
+            if update:
+                await update.message.reply_text(
+                    f"{EMOJI_ICONS['success']} Auction started successfully!\n\n"
+                    f"{EMOJI_ICONS['player']} Player: {player_data['name']}\n"
+                    f"{EMOJI_ICONS['money']} Base: {self.formatter.format_currency(player_data['base_price'])}\n"
+                    f"{EMOJI_ICONS['gear']} Mode: {current_mode.upper()}\n"
+                    f"{EMOJI_ICONS['timer']} Timer: {current_timer}s"
+                )
             
             return True
             
         except Exception as e:
             logger.error(f"Error creating auction: {e}")
-            await update.message.reply_text(
-                f"{EMOJI_ICONS['error']} Failed to create auction: {str(e)}"
-            )
+            if update:
+                await update.message.reply_text(
+                    f"{EMOJI_ICONS['error']} Failed to create auction: {str(e)}"
+                )
             return False
             
     async def _send_auction_message(self, context, auction: Auction, auction_id: ObjectId):
-        """Send auction message with enhanced visuals"""
-        # Create visual auction message
-        countdown_bar = self.formatter.create_progress_bar(100, 10)
+        """Send auction message with countdown"""
+        current_mode = await self.db.get_setting("auction_mode") or ("auto" if AUTO_MODE else "manual")
         
-        auction_msg = f"""
-{EMOJI_ICONS['fire']} <b>LIVE AUCTION</b> {EMOJI_ICONS['fire']}
-
-{EMOJI_ICONS['player']} <b>Player:</b> {auction.player_name}
-{EMOJI_ICONS['money']} <b>Base Price:</b> {self.formatter.format_currency(auction.base_price)}
-
-{EMOJI_ICONS['chart_up']} <b>Current Bid:</b> {self.formatter.format_currency(auction.current_bid)}
-{EMOJI_ICONS['timer']} <b>Time:</b> {auction.timer_duration}s
-
-{countdown_bar}
-
-{EMOJI_ICONS['target']} <b>Quick Bid Options:</b>
-        """.strip()
+        # Create initial auction message
+        auction_msg = await self._format_auction_message(
+            auction.player_name,
+            auction.base_price,
+            auction.current_bid,
+            auction.current_bidder,
+            auction.timer_duration if current_mode == 'auto' else None,
+            auction.player_data
+        )
         
-        # Create quick bid buttons
-        keyboard = []
-        for amount in QUICK_BID_AMOUNTS:
-            new_bid = auction.current_bid + amount
-            button_text = f"{EMOJI_ICONS['bid']} +{amount // 1_000_000}M ({new_bid // 1_000_000}M)"
-            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"qbid_{auction_id}_{new_bid}")])
-            
-        keyboard.append([
-            InlineKeyboardButton(f"{EMOJI_ICONS['stats']} Stats", callback_data=f"auction_stats_{auction_id}"),
-            InlineKeyboardButton(f"{EMOJI_ICONS['bell']} Watch", callback_data=f"watch_auction_{auction_id}")
-        ])
+        # Create bid buttons
+        keyboard = self._create_auction_buttons(auction.current_bid, auction.base_price, str(auction_id))
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
         
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        # Send with image if available
+        # Send message with player image if available
         try:
             if auction.player_data and auction.player_data.get('image_url'):
                 sent_message = await context.bot.send_photo(
@@ -311,131 +338,230 @@ class AdminHandlers:
                     reply_markup=reply_markup
                 )
             else:
-                # Send with animation
-                sent_message = await context.bot.send_animation(
+                sent_message = await context.bot.send_message(
                     AUCTION_GROUP_ID,
-                    animation=AUCTION_START_GIF,
-                    caption=auction_msg,
+                    auction_msg,
                     parse_mode='HTML',
                     reply_markup=reply_markup
                 )
-        except:
-            # Fallback to text message
+        except Exception as e:
+            logger.error(f"Error sending auction message: {e}")
+            # Fallback to text only
             sent_message = await context.bot.send_message(
                 AUCTION_GROUP_ID,
                 auction_msg,
                 parse_mode='HTML',
                 reply_markup=reply_markup
             )
-            
+        
         # Update auction with message ID
         await self.db.auctions.update_one(
             {"_id": auction_id},
             {"$set": {"message_id": sent_message.message_id}}
         )
         
-        # Start countdown updates
-        self.countdown.start_countdown(
-            str(auction_id), 
-            auction.timer_duration, 
-            self._update_auction_message,
-            context
-        )
+        # Start countdown if auto mode
+        if current_mode == 'auto':
+            # Define update callback
+            async def update_auction_display(auction_id_str: str, time_left: int):
+                await self._update_auction_timer_display(ObjectId(auction_id_str), time_left, context)
+            
+            # Start countdown
+            await self.countdown.start_countdown(
+                str(auction_id),
+                auction.timer_duration,
+                sent_message,
+                context,
+                update_callback=update_auction_display
+            )
+            
+            # Start auction timer task
+            await self._start_auction_timer(auction_id, auction.timer_duration, context)
         
-    async def _update_auction_message(self, auction_id: str, time_left: int, context):
-        """Update auction message with countdown"""
+        return sent_message
+    
+    async def _update_auction_timer_display(self, auction_id: ObjectId, time_left: int, context):
+        """Update auction message with new timer"""
         try:
-            auction = await self.db.auctions.find_one({"_id": ObjectId(auction_id)})
+            # Get current auction data
+            auction = await self.db.auctions.find_one({"_id": auction_id})
             if not auction or auction['status'] != 'active':
                 return
                 
-            # Determine urgency level
-            urgency = self.countdown.get_urgency_level(time_left)
-            emoji = COUNTDOWN_STAGES[min(k for k in COUNTDOWN_STAGES.keys() if k >= time_left)]['emoji']
+            # Format updated message
+            auction_msg = await self._format_auction_message(
+                auction['player_name'],
+                auction['base_price'],
+                auction['current_bid'],
+                auction['current_bidder'],
+                time_left,
+                auction.get('player_data')
+            )
             
-            # Update progress bar
-            progress = ((auction['timer_duration'] - time_left) / auction['timer_duration']) * 100
-            countdown_bar = self.formatter.create_progress_bar(progress, 10)
-            
-            # Format current bidder info
-            bidder_info = ""
-            if auction['current_bidder']:
-                bidder = await self.db.get_manager(auction['current_bidder'])
-                if bidder:
-                    bidder_info = f"\n{EMOJI_ICONS['winner']} <b>Leading:</b> {bidder.name}"
-            
-            auction_msg = f"""
-{EMOJI_ICONS['fire']} <b>LIVE AUCTION</b> {EMOJI_ICONS['fire']}
-
-{EMOJI_ICONS['player']} <b>Player:</b> {auction['player_name']}
-{EMOJI_ICONS['money']} <b>Base Price:</b> {self.formatter.format_currency(auction['base_price'])}
-
-{EMOJI_ICONS['chart_up']} <b>Current Bid:</b> {self.formatter.format_currency(auction['current_bid'])}{bidder_info}
-{emoji} <b>Time:</b> {time_left}s
-
-{countdown_bar}
-
-{self._get_urgency_message(urgency)}
-            """.strip()
-            
-            # Update quick bid buttons
-            keyboard = []
-            for amount in QUICK_BID_AMOUNTS:
-                new_bid = auction['current_bid'] + amount
-                button_text = f"{EMOJI_ICONS['bid']} +{amount // 1_000_000}M ({new_bid // 1_000_000}M)"
-                keyboard.append([InlineKeyboardButton(button_text, callback_data=f"qbid_{auction_id}_{new_bid}")])
-                
-            keyboard.append([
-                InlineKeyboardButton(f"{EMOJI_ICONS['stats']} Stats", callback_data=f"auction_stats_{auction_id}"),
-                InlineKeyboardButton(f"{EMOJI_ICONS['bell']} Watch", callback_data=f"watch_auction_{auction_id}")
-            ])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            # Create bid buttons
+            keyboard = self._create_auction_buttons(
+                auction['current_bid'], 
+                auction['base_price'], 
+                str(auction_id)
+            )
+            reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
             
             # Update message
             if auction.get('message_id'):
                 try:
-                    await context.bot.edit_message_caption(
-                        chat_id=AUCTION_GROUP_ID,
-                        message_id=auction['message_id'],
-                        caption=auction_msg,
-                        parse_mode='HTML',
-                        reply_markup=reply_markup
-                    )
+                    # Check if it's a photo or text message
+                    if auction.get('player_data', {}).get('image_url'):
+                        await context.bot.edit_message_caption(
+                            chat_id=AUCTION_GROUP_ID,
+                            message_id=auction['message_id'],
+                            caption=auction_msg,
+                            parse_mode='HTML',
+                            reply_markup=reply_markup
+                        )
+                    else:
+                        await context.bot.edit_message_text(
+                            chat_id=AUCTION_GROUP_ID,
+                            message_id=auction['message_id'],
+                            text=auction_msg,
+                            parse_mode='HTML',
+                            reply_markup=reply_markup
+                        )
                 except BadRequest as e:
-                    if "message is not modified" not in str(e):
-                        logger.error(f"Error updating auction message: {e}")
-            
+                    if "message is not modified" not in str(e).lower():
+                        logger.error(f"Error updating auction display: {e}")
+                        
         except Exception as e:
-            logger.error(f"Error in countdown update: {e}")
-            
-    def _get_urgency_message(self, urgency: str) -> str:
-        """Get urgency message based on time left"""
-        messages = {
-            'low': f"{EMOJI_ICONS['info']} Place your bids now!",
-            'medium': f"{EMOJI_ICONS['warning']} Hurry up! Time is running out!",
-            'high': f"{EMOJI_ICONS['fire']} FINAL MOMENTS! Last chance to bid!",
-            'critical': f"{EMOJI_ICONS['bell']} GOING ONCE... GOING TWICE..."
-        }
-        return messages.get(urgency, "")
+            logger.error(f"Error updating auction timer display: {e}")
+
+    async def _format_auction_message(self, player_name: str, base_price: int, 
+                                    current_bid: int, current_bidder: Optional[int],
+                                    time_left: Optional[int], player_data: Optional[dict]) -> str:
+        """Format auction message with all details"""
+        # Get bidder name if exists
+        bidder_info = ""
+        if current_bidder:
+            manager = await self.db.get_manager(current_bidder)
+            if manager:
+                bidder_info = f"\n{EMOJI_ICONS['winner']} <b>Leading:</b> {manager.name}"
+            else:
+                bidder_info = f"\n{EMOJI_ICONS['winner']} <b>Leading:</b> User {current_bidder}"
         
-    async def _start_auction_timer(self, auction_id: ObjectId, context):
-        """Start auction timer for auto mode"""
+        # Time display for auto mode
+        time_display = ""
+        if time_left is not None:
+            if time_left <= 10:
+                time_display = f"\n\n{EMOJI_ICONS['warning']} <b>TIME LEFT:</b> 🔴 {time_left}s 🔴"
+            elif time_left <= 30:
+                time_display = f"\n\n{EMOJI_ICONS['timer']} <b>TIME LEFT:</b> 🟡 {time_left}s 🟡"
+            else:
+                mins = time_left // 60
+                secs = time_left % 60
+                time_display = f"\n\n{EMOJI_ICONS['timer']} <b>TIME LEFT:</b> 🟢 {mins}:{secs:02d} 🟢"
+        
+        # Player details
+        position_info = ""
+        rating_info = ""
+        if player_data:
+            if player_data.get('position'):
+                position_info = f"\n📍 <b>Position:</b> {player_data['position']}"
+            if player_data.get('rating'):
+                rating_info = f"\n⭐ <b>Rating:</b> {player_data['rating']}"
+        
+        # Current bid display
+        current_bid_display = self.formatter.format_currency(current_bid) if current_bid > 0 else "No bids yet"
+        
+        msg = f"""
+{EMOJI_ICONS['fire']} <b>LIVE AUCTION</b> {EMOJI_ICONS['fire']}
+
+{EMOJI_ICONS['player']} <b>Player:</b> {player_name}{position_info}{rating_info}
+{EMOJI_ICONS['money']} <b>Base Price:</b> {self.formatter.format_currency(base_price)}
+
+{EMOJI_ICONS['chart_up']} <b>Current Bid:</b> {current_bid_display}{bidder_info}
+{time_display}
+        """.strip()
+        
+        return msg
+        
+    async def _update_auction_message(self, auction_id: str, time_left: int, context):
+        """This method is handled by GIF countdown now"""
+        pass
+
+    def _create_auction_buttons(self, current_bid: int, base_price: int, auction_id: str) -> list:
+        """Create quick bid buttons"""
+        buttons = []
+        
+        if current_bid == 0:
+            # First bid must be base price
+            button_text = f"{EMOJI_ICONS['bid']} Bid {base_price // 1_000_000}M"
+            buttons.append([InlineKeyboardButton(button_text, callback_data=f"qbid_{auction_id}_{base_price}")])
+        elif current_bid < 20_000_000:
+            # Only +1M increment allowed
+            new_bid = current_bid + 1_000_000
+            button_text = f"{EMOJI_ICONS['bid']} Bid {new_bid // 1_000_000}M (+1M)"
+            buttons.append([InlineKeyboardButton(button_text, callback_data=f"qbid_{auction_id}_{new_bid}")])
+        else:
+            # Multiple increment options
+            increments = [1_000_000, 2_000_000, 5_000_000, 10_000_000]
+            for i, inc in enumerate(increments):
+                if i % 2 == 0:
+                    row = []
+                new_bid = current_bid + inc
+                button_text = f"+{inc // 1_000_000}M ({new_bid // 1_000_000}M)"
+                row.append(InlineKeyboardButton(button_text, callback_data=f"qbid_{auction_id}_{new_bid}"))
+                if i % 2 == 1 or i == len(increments) - 1:
+                    buttons.append(row)
+        
+        return buttons
+        
+    async def _start_auction_timer(self, auction_id: ObjectId, duration: int, context):
+        """Start auction timer for auto mode with proper end time tracking"""
         async def timer_callback():
-            auction = await self.db.auctions.find_one({"_id": auction_id})
-            if auction:
-                await asyncio.sleep(auction['timer_duration'])
-                await self._end_auction_automatically(auction_id, context)
-            
+            try:
+                # Store the end time when timer starts
+                end_time = datetime.now().timestamp() + duration
+                
+                while True:
+                    # Check current time against end time
+                    current_time = datetime.now().timestamp()
+                    remaining = end_time - current_time
+                    
+                    if remaining <= 0:
+                        # Time's up - check if auction is still active
+                        auction = await self.db.auctions.find_one({"_id": auction_id})
+                        if auction and auction['status'] == 'active':
+                            logger.info(f"Timer expired for auction {auction_id}")
+                            await self._end_auction_automatically(auction_id, context)
+                        break
+                    
+                    # Check if task was cancelled (bid placed)
+                    if auction_id not in self.auction_tasks:
+                        logger.info(f"Timer task removed for auction {auction_id}")
+                        break
+                    
+                    # Sleep for a short interval
+                    await asyncio.sleep(1)
+                    
+            except asyncio.CancelledError:
+                logger.info(f"Timer cancelled for auction {auction_id}")
+            except Exception as e:
+                logger.error(f"Error in auction timer: {e}")
+        
+        # Cancel any existing timer for this auction
+        if auction_id in self.auction_tasks:
+            self.auction_tasks[auction_id].cancel()
+            await asyncio.sleep(0.1)
+        
+        # Create and store new task
         task = asyncio.create_task(timer_callback())
         self.auction_tasks[auction_id] = task
+        logger.info(f"Started new timer for auction {auction_id} with duration {duration}s")
         
     async def _end_auction_automatically(self, auction_id: ObjectId, context):
         """End auction when timer expires"""
         auction = await self.db.auctions.find_one({"_id": auction_id})
         if not auction or auction.get('status') != 'active':
             return
-            
+        
         # Stop countdown
         self.countdown.stop_countdown(str(auction_id))
         
@@ -533,6 +659,21 @@ class AdminHandlers:
             except:
                 pass
                 
+            # Start break timer before next auction (only in auto mode)
+            current_mode = await self.db.get_setting("auction_mode") or ("auto" if AUTO_MODE else "manual")
+            if current_mode == 'auto':
+                await self._start_break_timer(context)
+            else:
+                # In manual mode, just process next auction if queue exists
+                if self.auction_queue:
+                    await context.bot.send_message(
+                        AUCTION_GROUP_ID,
+                        f"{EMOJI_ICONS['info']} Ready for next auction. Admin can use /next to start.",
+                        parse_mode='HTML'
+                    )
+                else:
+                    await self._finish_auction_session(context)
+            
         except Exception as e:
             logger.error(f"Error finalizing auction win: {e}")
             
@@ -545,7 +686,7 @@ class AdminHandlers:
                     auction['player_data']['message_id'],
                     'unsold'
                 )
-                
+            
             # Complete auction
             await self.db.complete_auction(auction['_id'])
             
@@ -565,27 +706,379 @@ class AdminHandlers:
                 parse_mode='HTML'
             )
             
-            # Forward to unsold group
+            # Forward to unsold group with original format
             if UNSOLD_GROUP_ID:
                 try:
-                    unsold_detail = f"""
-🔴 <b>UNSOLD PLAYER</b>
-
-{EMOJI_ICONS['player']} {auction['player_name']}
-{EMOJI_ICONS['money']} Base: {self.formatter.format_currency(auction['base_price'])}
-{EMOJI_ICONS['timer']} Time: {datetime.now().strftime('%H:%M:%S')}
-                    """.strip()
+                    # Use original caption format
+                    unsold_caption = f"'{auction['player_name']}' {auction['base_price'] // 1_000_000}"
                     
-                    await context.bot.send_message(
-                        UNSOLD_GROUP_ID,
-                        unsold_detail,
-                        parse_mode='HTML'
-                    )
+                    # Send with image if available
+                    if auction.get('player_data', {}).get('image_url'):
+                        await context.bot.send_photo(
+                            UNSOLD_GROUP_ID,
+                            photo=auction['player_data']['image_url'],
+                            caption=unsold_caption
+                        )
+                    else:
+                        await context.bot.send_message(
+                            UNSOLD_GROUP_ID,
+                            unsold_caption
+                        )
                 except Exception as e:
                     logger.error(f"Error sending to unsold group: {e}")
+            
+            # Start break timer before next auction (only in auto mode)
+            current_mode = await self.db.get_setting("auction_mode") or ("auto" if AUTO_MODE else "manual")
+            if current_mode == 'auto':
+                await self._start_break_timer(context)
+            else:
+                # In manual mode, just notify admin
+                if self.auction_queue:
+                    await context.bot.send_message(
+                        AUCTION_GROUP_ID,
+                        f"{EMOJI_ICONS['info']} Ready for next auction. Admin can use /next to start.",
+                        parse_mode='HTML'
+                    )
+                else:
+                    await self._finish_auction_session(context)
                 
         except Exception as e:
             logger.error(f"Error finalizing unsold auction: {e}")
+            
+    async def _start_break_timer(self, context):
+        """Start break timer between auctions"""
+        # Get break duration from settings
+        break_duration = await self.db.get_setting("auction_break") or AUCTION_BREAK
+        
+        # Set break flag
+        self.is_in_break = True
+        
+        # Get current mode
+        current_mode = await self.db.get_setting("auction_mode") or ("auto" if AUTO_MODE else "manual")
+        
+        # Send break message with countdown
+        break_msg = f"""
+{EMOJI_ICONS['clock']} <b>AUCTION BREAK</b>
+
+Next auction starts in {break_duration} seconds...
+
+{EMOJI_ICONS['info']} <i>Take a moment to plan your strategy!</i>
+        """.strip()
+        
+        keyboard = []
+        if current_mode == 'auto':
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{EMOJI_ICONS['rocket']} Skip Break", 
+                    callback_data="skip_break"
+                )
+            ])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        
+        break_message = await context.bot.send_message(
+            AUCTION_GROUP_ID,
+            break_msg,
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+        
+        # Start break countdown
+        async def break_countdown():
+            try:
+                last_update = 0
+                for i in range(break_duration, 0, -1):
+                    # Update every 5 seconds to avoid rate limits
+                    if i % 5 == 0 and i != last_update:
+                        try:
+                            break_msg_update = f"""
+{EMOJI_ICONS['clock']} <b>AUCTION BREAK</b>
+
+Next auction starts in {i} seconds...
+
+{EMOJI_ICONS['info']} <i>Take a moment to plan your strategy!</i>
+                            """.strip()
+                            
+                            await context.bot.edit_message_text(
+                                chat_id=AUCTION_GROUP_ID,
+                                message_id=break_message.message_id,
+                                text=break_msg_update,
+                                parse_mode='HTML',
+                                reply_markup=reply_markup
+                            )
+                            last_update = i
+                        except:
+                            pass
+                    
+                    await asyncio.sleep(1)
+                        
+                # Break finished
+                self.is_in_break = False
+                
+                # Delete break message
+                try:
+                    await context.bot.delete_message(
+                        chat_id=AUCTION_GROUP_ID,
+                        message_id=break_message.message_id
+                    )
+                except:
+                    pass
+                    
+                # Continue with next auction
+                if current_mode == 'auto' and self.auction_queue:
+                    await self._process_next_in_queue(context)
+                else:
+                    if not self.auction_queue:
+                        await self._finish_auction_session(context)
+                    else:
+                        await context.bot.send_message(
+                            AUCTION_GROUP_ID,
+                            f"{EMOJI_ICONS['info']} Break finished. Admin can start next auction.",
+                            parse_mode='HTML'
+                        )
+                        
+            except asyncio.CancelledError:
+                logger.info("Break timer cancelled")
+                self.is_in_break = False
+                
+        self.break_timer_task = asyncio.create_task(break_countdown())
+        
+    async def _finish_auction_session(self, context):
+        """Finish the auction session"""
+        try:
+            # Close session
+            if self.current_session:
+                await self.db.close_session(self.current_session)
+            
+            # Get all managers for final report
+            managers = await self.db.get_all_managers()
+            
+            # Create summary
+            total_spent = sum(m.total_spent for m in managers)
+            total_players = sum(len(m.players) for m in managers)
+            active_managers = len([m for m in managers if m.players])
+            
+            summary_msg = f"""
+{EMOJI_ICONS['trophy']} <b>AUCTION SESSION COMPLETE!</b>
+
+{EMOJI_ICONS['chart']} <b>Session Summary:</b>
+- Total Managers: {len(managers)}
+- Active Bidders: {active_managers}
+- Players Sold: {total_players}
+- Total Revenue: {self.formatter.format_currency(total_spent)}
+
+{EMOJI_ICONS['sparkles']} <i>Thanks for participating!</i>
+
+Use /managers_summary or /managers_detailed to view full results.
+            """.strip()
+            
+            await context.bot.send_message(
+                AUCTION_GROUP_ID,
+                summary_msg,
+                parse_mode='HTML'
+            )
+            
+            # Clear session
+            self.current_session = None
+            self.auction_queue = []
+            
+        except Exception as e:
+            logger.error(f"Error finishing session: {e}")
+            
+    async def handle_new_bid(self, auction_id: ObjectId, bidder_id: int, amount: int, context):
+        """Handle new bid and reset timer"""
+        try:
+            # Get auction
+            auction = await self.db.auctions.find_one({"_id": auction_id})
+            if not auction or auction['status'] != 'active':
+                return
+            
+            current_mode = await self.db.get_setting("auction_mode") or ("auto" if AUTO_MODE else "manual")
+            
+            if current_mode == 'auto':
+                # Cancel existing timer task
+                if auction_id in self.auction_tasks:
+                    self.auction_tasks[auction_id].cancel()
+                    await asyncio.sleep(0.1)
+                    del self.auction_tasks[auction_id]
+                
+                timer_duration = auction.get('timer_duration', AUCTION_TIMER)
+                
+                # Reset countdown
+                reset_success = await self.countdown.reset_countdown(str(auction_id), timer_duration)
+                
+                if reset_success:
+                    # Start new timer task
+                    await self._start_auction_timer(auction_id, timer_duration, context)
+                    
+                    # Update display immediately
+                    await self._update_auction_timer_display(auction_id, timer_duration, context)
+                    
+                    logger.info(f"Timer reset for auction {auction_id} to {timer_duration}s")
+                else:
+                    logger.warning(f"Failed to reset countdown for auction {auction_id}")
+            else:
+                # Manual mode - just update display
+                await self._update_auction_timer_display(auction_id, None, context)
+            
+        except Exception as e:
+            logger.error(f"Error handling new bid timer reset: {e}")
+
+    async def _delete_message_after(self, message, seconds):
+        """Delete a message after specified seconds"""
+        await asyncio.sleep(seconds)
+        try:
+            await message.delete()
+        except:
+            pass
+
+    async def _update_manual_auction_message(self, auction: dict, bidder_id: int, amount: int, context):
+        """Update manual mode auction message after new bid"""
+        try:
+            # Get bidder info
+            bidder = await self.db.get_manager(bidder_id)
+            if not bidder:
+                return
+                
+            auction_msg = f"""
+{EMOJI_ICONS['fire']} <b>LIVE AUCTION</b> {EMOJI_ICONS['fire']}
+
+{EMOJI_ICONS['player']} <b>Player:</b> {auction['player_name']}
+{EMOJI_ICONS['money']} <b>Base Price:</b> {self.formatter.format_currency(auction['base_price'])}
+{EMOJI_ICONS['chart_up']} <b>Current Bid:</b> {self.formatter.format_currency(amount)}
+{EMOJI_ICONS['winner']} <b>Leading:</b> {bidder.name}
+
+{EMOJI_ICONS['info']} <i>Manual Mode - Admin will call final bid</i>
+            """.strip()
+            
+            # NO quick bid buttons for manual mode
+            reply_markup = None
+            
+            # Update message
+            if auction.get('message_id'):
+                try:
+                    if auction.get('player_data', {}).get('image_url'):
+                        await context.bot.edit_message_caption(
+                            chat_id=AUCTION_GROUP_ID,
+                            message_id=auction['message_id'],
+                            caption=auction_msg,
+                            parse_mode='HTML',
+                            reply_markup=reply_markup  # No buttons
+                        )
+                    else:
+                        await context.bot.edit_message_text(
+                            chat_id=AUCTION_GROUP_ID,
+                            message_id=auction['message_id'],
+                            text=auction_msg,
+                            parse_mode='HTML',
+                            reply_markup=reply_markup  # No buttons
+                        )
+                except BadRequest as e:
+                    if "message is not modified" not in str(e):
+                        logger.error(f"Error updating manual auction message: {e}")
+                        
+        except Exception as e:
+            logger.error(f"Error updating manual auction message: {e}")
+
+    async def _update_auction_with_new_bid(self, auction: dict, bidder_id: int, amount: int, context):
+        """Update auction message after new bid"""
+        try:
+            current_mode = await self.db.get_setting("auction_mode") or ("auto" if AUTO_MODE else "manual")
+            
+            # Get bidder info
+            bidder = await self.db.get_manager(bidder_id)
+            if not bidder:
+                return
+                
+            if current_mode == 'manual':
+                # Simple update for manual mode
+                auction_msg = f"""
+{EMOJI_ICONS['fire']} <b>LIVE AUCTION</b> {EMOJI_ICONS['fire']}
+
+{EMOJI_ICONS['player']} <b>Player:</b> {auction['player_name']}
+{EMOJI_ICONS['money']} <b>Base Price:</b> {self.formatter.format_currency(auction['base_price'])}
+{EMOJI_ICONS['chart_up']} <b>Current Bid:</b> {self.formatter.format_currency(amount)}
+{EMOJI_ICONS['winner']} <b>Leading:</b> {bidder.name}
+
+{EMOJI_ICONS['info']} <i>Manual Mode - Admin will call final bid</i>
+                """.strip()
+                reply_markup = None
+            else:
+                # Auto mode update
+                auction_msg = f"""
+{EMOJI_ICONS['fire']} <b>LIVE AUCTION</b> {EMOJI_ICONS['fire']}
+
+{EMOJI_ICONS['player']} <b>Player:</b> {auction['player_name']}
+{EMOJI_ICONS['money']} <b>Base Price:</b> {self.formatter.format_currency(auction['base_price'])}
+
+{EMOJI_ICONS['chart_up']} <b>Current Bid:</b> {self.formatter.format_currency(amount)}
+{EMOJI_ICONS['winner']} <b>Leading:</b> {bidder.name}
+{EMOJI_ICONS['timer']} <b>Timer Reset!</b> Check live timer above ⬆️
+
+{EMOJI_ICONS['fire']} <i>New bid placed - timer restarted!</i>
+                """.strip()
+                
+                # Update quick bid buttons
+                keyboard = []
+                if amount >= auction['base_price'] and amount < 20_000_000:
+                    new_bid = amount + 1_000_000
+                    button_text = f"{EMOJI_ICONS['bid']} Bid {new_bid // 1_000_000}M (+1M)"
+                    keyboard.append([InlineKeyboardButton(button_text, callback_data=f"qbid_{auction['_id']}_{new_bid}")])
+                else:
+                    increments = [1_000_000, 2_000_000, 5_000_000, 10_000_000]
+                    for i, inc in enumerate(increments):
+                        if i % 2 == 0:
+                            row = []
+                        new_bid = amount + inc
+                        button_text = f"+{inc // 1_000_000}M ({new_bid // 1_000_000}M)"
+                        row.append(InlineKeyboardButton(button_text, callback_data=f"qbid_{auction['_id']}_{new_bid}"))
+                        if i % 2 == 1 or i == len(increments) - 1:
+                            keyboard.append(row)
+                            
+                reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+            
+            # Update message
+            if auction.get('message_id'):
+                try:
+                    if auction.get('player_data', {}).get('image_url'):
+                        await context.bot.edit_message_caption(
+                            chat_id=AUCTION_GROUP_ID,
+                            message_id=auction['message_id'],
+                            caption=auction_msg,
+                            parse_mode='HTML',
+                            reply_markup=reply_markup
+                        )
+                    else:
+                        await context.bot.edit_message_text(
+                            chat_id=AUCTION_GROUP_ID,
+                            message_id=auction['message_id'],
+                            text=auction_msg,
+                            parse_mode='HTML',
+                            reply_markup=reply_markup
+                        )
+                except BadRequest as e:
+                    if "message is not modified" not in str(e):
+                        logger.error(f"Error updating auction message: {e}")
+                        
+        except Exception as e:
+            logger.error(f"Error updating auction with new bid: {e}")
+            
+    async def skip_break(self, query, context):
+        """Skip the break between auctions"""
+        if self.break_timer_task:
+            self.break_timer_task.cancel()
+            self.is_in_break = False
+            
+            # Delete the break message if query exists
+            if query:
+                try:
+                    await query.message.delete()
+                except:
+                    pass
+                await query.answer("Break skipped! Starting next auction...")
+            
+            # Continue to next auction
+            await self._process_next_in_queue(context)
             
     async def stop_auction(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Stop/pause current auction"""
@@ -603,8 +1096,11 @@ class AdminHandlers:
                 f"{EMOJI_ICONS['error']} No active auction to stop!"
             )
             return
-            
-        # Stop countdown
+        
+        # Stop GIF countdown
+        await self.gif_countdown.stop_auction_display(str(current_auction._id), context)
+        
+        # Stop regular countdown
         self.countdown.stop_countdown(str(current_auction._id))
         
         # Cancel timer
@@ -665,16 +1161,33 @@ class AdminHandlers:
         
         # Get auction details
         auction = await self.db.get_current_auction()
-        if auction and auction.mode == 'auto':
-            # Restart timer with remaining time
-            current_timer = await self.db.get_setting("auction_timer") or AUCTION_TIMER
-            await self._start_auction_timer(auction._id, context)
-            self.countdown.start_countdown(
-                str(auction._id),
-                current_timer,
-                self._update_auction_message,
-                context
-            )
+
+        auction_id = auction._id
+
+        await self._send_auction_message(context, auction, auction_id)
+
+        # if auction and auction.mode == 'auto':
+        #     # Restart GIF countdown with remaining time
+        #     current_timer = await self.db.get_setting("auction_timer") or AUCTION_TIMER
+            
+        #     auction_data = {
+        #         '_id': str(auction._id),
+        #         'player_name': auction.player_name,
+        #         'base_price': auction.base_price,
+        #         'current_bid': auction.current_bid,
+        #         'current_bidder': auction.current_bidder,
+        #         'player_data': auction.player_data
+        #     }
+            
+        #     await self.gif_countdown.start_auction_display(
+        #         str(auction._id),
+        #         auction_data,
+        #         current_timer,
+        #         context,
+        #         AUCTION_GROUP_ID
+        #     )
+            
+        #     await self._start_auction_timer(auction._id, current_timer, context)
             
         await update.message.reply_text(
             f"{EMOJI_ICONS['success']} Auction resumed!"
@@ -724,7 +1237,7 @@ class AdminHandlers:
         )
         
     async def final_call(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Final call for manual mode"""
+        """Final call for manual mode or to speed up auto mode"""
         user_id = update.effective_user.id
         
         if user_id not in ADMIN_IDS:
@@ -733,20 +1246,31 @@ class AdminHandlers:
             )
             return
             
+        # Check if we're in break
+        if self.is_in_break:
+            # Skip break and continue
+            await self.skip_break(None, context)
+            await update.message.reply_text(
+                f"{EMOJI_ICONS['rocket']} Break skipped! Starting next auction..."
+            )
+            return
+            
         current_auction = await self.db.get_current_auction()
         if not current_auction:
-            await update.message.reply_text(
-                f"{EMOJI_ICONS['error']} No active auction!"
-            )
+            # No active auction, check if there are players in queue
+            if self.auction_queue:
+                await self._process_next_in_queue(context)
+                await update.message.reply_text(
+                    f"{EMOJI_ICONS['success']} Starting next auction!"
+                )
+            else:
+                await update.message.reply_text(
+                    f"{EMOJI_ICONS['error']} No active auction or players in queue!"
+                )
             return
             
         current_mode = await self.db.get_setting("auction_mode") or ("auto" if AUTO_MODE else "manual")
-        if current_mode == 'auto':
-            await update.message.reply_text(
-                f"{EMOJI_ICONS['warning']} Cannot use final call in auto mode!"
-            )
-            return
-            
+        
         # Send final call message
         final_msg = f"""
 {EMOJI_ICONS['bell']} <b>FINAL CALL!</b> {EMOJI_ICONS['bell']}
@@ -775,6 +1299,14 @@ Last chance to bid!
                 f"{EMOJI_ICONS['info']} New bid received! Continue auction."
             )
         else:
+            # Cancel existing timer
+            if current_auction._id in self.auction_tasks:
+                self.auction_tasks[current_auction._id].cancel()
+                del self.auction_tasks[current_auction._id]
+                
+            # Stop countdown
+            self.countdown.stop_countdown(str(current_auction._id))
+            
             # Finalize
             if current_auction.current_bidder:
                 await self._finalize_auction_win(
@@ -985,6 +1517,7 @@ Current bid: {self.formatter.format_currency(new_current_bid)}
         # Get current settings
         current_mode = await self.db.get_setting("auction_mode") or ("auto" if AUTO_MODE else "manual")
         current_timer = await self.db.get_setting("auction_timer") or AUCTION_TIMER
+        current_break = await self.db.get_setting("auction_break") or 30
         current_budget = await self.db.get_setting("default_balance") or DEFAULT_BALANCE
         analytics_enabled = await self.db.get_setting("track_analytics")
         if analytics_enabled is None:
@@ -1005,7 +1538,7 @@ Current bid: {self.formatter.format_currency(new_current_bid)}
             ],
             [
                 InlineKeyboardButton("🎯 Session", callback_data="settings_session"),
-                InlineKeyboardButton("🏢 Groups", callback_data="settings_groups")
+                InlineKeyboardButton("⏸️ Break Timer", callback_data="settings_break")
             ],
             [InlineKeyboardButton("🔙 Back", callback_data="start")]
         ]
@@ -1017,6 +1550,7 @@ Current bid: {self.formatter.format_currency(new_current_bid)}
 
 🎮 Mode: <b>{current_mode.upper()}</b>
 ⏰ Timer: <b>{current_timer}s</b>
+⏸️ Break: <b>{current_break}s</b>
 💰 Default Balance: <b>{self.formatter.format_currency(current_budget)}</b>
 📊 Analytics: <b>{'ON' if analytics_enabled else 'OFF'}</b>
 
@@ -1172,3 +1706,119 @@ Connected Groups: {len(groups)}
                     
         except Exception as e:
             logger.error(f"Error processing data message: {e}")
+
+    async def show_all_managers_summary(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show all managers with balance and player count"""
+        user_id = update.effective_user.id
+        
+        if user_id not in ADMIN_IDS:
+            await update.message.reply_text(
+                f"{EMOJI_ICONS['error']} Admin access required!"
+            )
+            return
+        
+        managers = await self.db.get_all_managers()
+        
+        if not managers:
+            await update.message.reply_text(
+                f"{EMOJI_ICONS['error']} No managers found!"
+            )
+            return
+        
+        # Sort by balance
+        managers.sort(key=lambda m: m.balance, reverse=True)
+        
+        msg = f"{EMOJI_ICONS['team']} <b>ALL MANAGERS SUMMARY</b>\n\n"
+        
+        for i, manager in enumerate(managers, 1):
+            msg += f"{i}. <b>{manager.name}</b>"
+            if manager.team_name:
+                msg += f" ({manager.team_name})"
+            msg += f"\n   {EMOJI_ICONS['money']} Balance: {self.formatter.format_currency(manager.balance)}"
+            msg += f"\n   {EMOJI_ICONS['player']} Players: {len(manager.players)}\n\n"
+        
+        await update.message.reply_text(msg, parse_mode='HTML')
+
+    async def show_all_managers_detailed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show detailed info for all managers"""
+        user_id = update.effective_user.id
+        
+        if user_id not in ADMIN_IDS:
+            await update.message.reply_text(
+                f"{EMOJI_ICONS['error']} Admin access required!"
+            )
+            return
+        
+        managers = await self.db.get_all_managers()
+        
+        if not managers:
+            await update.message.reply_text(
+                f"{EMOJI_ICONS['error']} No managers found!"
+            )
+            return
+        
+        # Send individual messages for each manager
+        for manager in managers:
+            msg = f"{EMOJI_ICONS['user']} <b>MANAGER DETAILS</b>\n\n"
+            msg += f"<b>Name:</b> {manager.name}\n"
+            if manager.team_name:
+                msg += f"<b>Team:</b> {manager.team_name}\n"
+            msg += f"<b>Balance:</b> {self.formatter.format_currency(manager.balance)}\n"
+            msg += f"<b>Total Spent:</b> {self.formatter.format_currency(manager.total_spent)}\n\n"
+            
+            if manager.players:
+                msg += f"{EMOJI_ICONS['trophy']} <b>PLAYERS ({len(manager.players)}):</b>\n"
+                for player in manager.players:
+                    if isinstance(player, dict):
+                        msg += f"• {player['name']} - {self.formatter.format_currency(player['price'])}\n"
+                    else:
+                        msg += f"• {player}\n"
+            else:
+                msg += f"{EMOJI_ICONS['info']} No players bought yet\n"
+            
+            await update.message.reply_text(msg, parse_mode='HTML')
+            await asyncio.sleep(0.5)  # Prevent flooding
+
+    async def next_player_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Move to next player in manual mode or break"""
+        user_id = update.effective_user.id
+        
+        if user_id not in ADMIN_IDS:
+            await update.message.reply_text(
+                f"{EMOJI_ICONS['error']} Admin access required!"
+            )
+            return
+            
+        # Check if we're in break
+        if self.is_in_break:
+            # Skip break and continue
+            await self.skip_break(None, context)
+            await update.message.reply_text(
+                f"{EMOJI_ICONS['rocket']} Break skipped! Starting next auction..."
+            )
+            return
+        
+        # Check if auction is active
+        current_auction = await self.db.get_current_auction()
+        if current_auction:
+            await update.message.reply_text(
+                f"{EMOJI_ICONS['warning']} There's an active auction! Use /final_call to end it first."
+            )
+            return
+        
+        # Process next in queue
+        if self.auction_queue:
+            success = await self._process_next_in_queue(context)
+            if success:
+                await update.message.reply_text(
+                    f"{EMOJI_ICONS['success']} Started next auction!"
+                )
+            else:
+                await update.message.reply_text(
+                    f"{EMOJI_ICONS['error']} Failed to start next auction!"
+                )
+        else:
+            await update.message.reply_text(
+                f"{EMOJI_ICONS['info']} No more players in queue!"
+            )
+            await self._finish_auction_session(context)

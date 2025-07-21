@@ -1,4 +1,4 @@
-# config/settings.py - Enhanced Configuration with Dynamic Updates
+# config/settings.py - Enhanced Configuration with Dynamic Updates and Break Timer
 import os
 from dotenv import load_dotenv
 
@@ -29,11 +29,26 @@ AUCTION_TIMER = 60              # seconds
 AUTO_MODE = True                # True for auto, False for manual
 WARNING_TIME = 10               # Final warning seconds
 QUICK_BID_AMOUNTS = [1_000_000, 2_000_000, 5_000_000]  # 1M, 2M, 5M
+AUCTION_BREAK = 30              # Default break between auctions (seconds)
 
 # Visual Elements
 WELCOME_GIF = "https://media.giphy.com/media/l0HlNaQ6gWfllcjDO/giphy.gif"
 AUCTION_START_GIF = "https://media.giphy.com/media/xT0xeJpnrWC4XWblEk/giphy.gif"
 WIN_STICKER = "CAACAgIAAxkBAAEBPQRhXoX5AAF5kgABQKN5AAH5yQ8AAgMAA8A2TxP5al-2ZdafVyEE"
+
+COUNTDOWN_GIFS = {
+    'start': 'https://media.giphy.com/media/l0HlNaQ6gWfllcjDO/giphy.gif',
+    '180_120': 'YOUR_180_120_GIF_URL',
+    '120_90': 'YOUR_120_90_GIF_URL',
+    '90_60': 'YOUR_90_60_GIF_URL',
+    '60_45': 'https://media.giphy.com/media/xT0xeJpnrWC4XWblEk/giphy.gif',
+    '45_30': 'https://media.giphy.com/media/3o7aCWJavAgtBzLWrS/giphy.gif',
+    '30_20': 'https://media.giphy.com/media/26BRuo6sLetdllPAQ/giphy.gif',
+    '20_10': 'https://media.giphy.com/media/3ohzdYJK1wAdPWVk88/giphy.gif',
+    '10_3': 'https://media.giphy.com/media/l0HlNaQ6gWfllcjDO/giphy.gif',
+    '3_0': 'https://media.giphy.com/media/xT0xeJpnrWC4XWblEk/giphy.gif',
+    'ended': 'https://media.giphy.com/media/3o7aCWJavAgtBzLWrS/giphy.gif'
+}
 
 # Enhanced Emoji System
 EMOJI_ICONS = {
@@ -98,6 +113,7 @@ EMOJI_ICONS = {
     'arrow_right': '➡️',
     'calendar': '📅',
     'gear': '⚙️',
+    'lock': '🔒',
     
     # Data and analytics
     'chart_up': '📈',
@@ -112,7 +128,6 @@ EMOJI_ICONS = {
     'link': '🔗',
     'key': '🔑',
     'shield': '🛡️',
-    'lock': '🔒',
     'unlock': '🔓'
 }
 
@@ -137,7 +152,6 @@ ACHIEVEMENTS = {
     'win_auction': {'name': 'Winner Winner', 'emoji': '🏆', 'points': 20, 'description': 'Win your first auction'},
     'bid_warrior': {'name': 'Bid Warrior', 'emoji': '⚔️', 'points': 50, 'description': 'Win 10 auctions'},
     'big_spender': {'name': 'Big Spender', 'emoji': '💎', 'points': 100, 'description': 'Spend over 100M total'},
-    'perfect_team': {'name': 'Perfect XI', 'emoji': '⭐', 'points': 200, 'description': 'Build a team of 11 players'},
     'auction_master': {'name': 'Auction Master', 'emoji': '👑', 'points': 500, 'description': 'Win 50 auctions'},
     'speed_bidder': {'name': 'Speed Demon', 'emoji': '⚡', 'points': 30, 'description': 'Place 5 bids in 1 minute'},
     'bargain_hunter': {'name': 'Bargain Hunter', 'emoji': '🏷️', 'points': 75, 'description': 'Win 5 players at base price'},
@@ -158,7 +172,7 @@ MESSAGE_COOLDOWN = 1  # seconds between messages
 EDIT_MESSAGE_LIMIT = 10  # max edits per message
 CALLBACK_TIMEOUT = 5  # seconds for callback response
 
-# Team Formation Templates
+# Team Formation Templates (Removed limit)
 FORMATIONS = {
     '4-3-3': {'defenders': 4, 'midfielders': 3, 'forwards': 3},
     '4-4-2': {'defenders': 4, 'midfielders': 4, 'forwards': 2},
@@ -284,9 +298,9 @@ SUPPORTED_TIMEZONES = [
     'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Kolkata', 'Asia/Dubai'
 ]
 
-# Help Documentation
+# Help Documentation - Fixed Keys
 HELP_SECTIONS = {
-    'basic_commands': {
+    'basic': {
         'title': '📚 Basic Commands',
         'description': 'Learn the essential commands to get started',
         'commands': [
@@ -297,7 +311,7 @@ HELP_SECTIONS = {
             '/leaderboard - See top managers'
         ]
     },
-    'bidding_guide': {
+    'bidding': {
         'title': '🎯 Bidding Guide',
         'description': 'Master the art of bidding',
         'content': [
@@ -308,7 +322,7 @@ HELP_SECTIONS = {
             'React quickly - auctions move fast!'
         ]
     },
-    'strategy_tips': {
+    'strategy': {
         'title': '🧠 Strategy Tips',
         'description': 'Pro tips for auction success',
         'tips': [
@@ -325,8 +339,9 @@ HELP_SECTIONS = {
         'rules': [
             'Minimum bid increment: 1M after 20M',
             'Starting balance: 200M for new managers',
-            'Maximum team size: 11 players',
+            'No maximum team size - buy unlimited players',
             'Auction timer: 60 seconds (configurable)',
+            'Timer resets on every new bid',
             'No bid cancellation once placed',
             'Fair play and respect for all participants'
         ]
@@ -350,6 +365,10 @@ HELP_SECTIONS = {
             {
                 'question': 'How are achievements earned?',
                 'answer': 'Through various activities like bidding, winning, and participation'
+            },
+            {
+                'question': 'Is there a limit on players I can buy?',
+                'answer': 'No! You can buy as many players as your budget allows'
             }
         ]
     }
@@ -359,6 +378,7 @@ HELP_SECTIONS = {
 DEFAULT_SETTINGS = {
     'auction_mode': 'auto',
     'auction_timer': 60,
+    'auction_break': 30,
     'default_balance': 200_000_000,
     'track_analytics': True,
     'notify_auction_start': True,
@@ -374,7 +394,7 @@ DEFAULT_SETTINGS = {
 # Function to update global settings from database
 async def update_settings_from_db(db):
     """Update global settings from database values"""
-    global AUTO_MODE, AUCTION_TIMER, DEFAULT_BALANCE, TRACK_ANALYTICS
+    global AUTO_MODE, AUCTION_TIMER, DEFAULT_BALANCE, TRACK_ANALYTICS, AUCTION_BREAK
     
     try:
         # Update auction mode
@@ -386,6 +406,11 @@ async def update_settings_from_db(db):
         timer = await db.get_setting("auction_timer")
         if timer:
             AUCTION_TIMER = timer
+            
+        # Update break timer
+        break_timer = await db.get_setting("auction_break")
+        if break_timer:
+            AUCTION_BREAK = break_timer
             
         # Update default balance
         balance = await db.get_setting("default_balance")

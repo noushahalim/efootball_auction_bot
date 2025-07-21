@@ -1,4 +1,4 @@
-# utilities/formatters.py - Enhanced Message Formatting with Visual Elements
+# utilities/formatters.py - Enhanced Message Formatting with Visual Elements...
 from datetime import datetime
 from typing import List, Optional
 from config.settings import *
@@ -77,19 +77,22 @@ To participate in auctions, you need to be added as a manager by an admin.
         """.strip()
         
     def format_new_bid(self, player_name: str, bidder_name: str, amount: int, time_left: Optional[int] = None) -> str:
-        """Format new bid announcement with urgency"""
+        """Format new bid announcement with proper name display"""
         urgency = ""
         if time_left and time_left <= 10:
             urgency = f"\n\n{self.icons['warning']} <b>FINAL SECONDS!</b> {self.icons['warning']}"
         elif time_left and time_left <= 30:
             urgency = f"\n\n{self.icons['timer']} Time is running out!"
             
+        # Ensure we're using the actual name, not a number
+        display_name = bidder_name if bidder_name and not bidder_name.startswith('#') else f"Manager {bidder_name}"
+            
         return f"""
 {self.icons['chart_up']} <b>NEW BID!</b> {self.icons['chart_up']}
 
 {self.icons['player']} <b>Player:</b> {player_name}
 {self.icons['moneybag']} <b>Amount:</b> {self.format_currency(amount)}
-{self.icons['crown']} <b>Leader:</b> {bidder_name}
+{self.icons['crown']} <b>Leader:</b> {display_name}
 {urgency}
 
 {self.icons['target']} <i>Can you beat this?</i>

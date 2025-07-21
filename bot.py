@@ -1,4 +1,4 @@
-# bot.py - Fixed Bot Entry Point with proper handler connections
+# bot.py - Fixed Main Bot Entry Point with Enhanced Features
 import asyncio
 import logging
 import os
@@ -58,8 +58,9 @@ logger = logging.getLogger(__name__)
 (
     WAITING_MANAGER_INPUT, WAITING_BROADCAST_INPUT, WAITING_MANUAL_PLAYER_NAME,
     WAITING_MANUAL_PLAYER_PRICE, WAITING_BAN_REASON, WAITING_SESSION_NAME,
-    WAITING_ADD_ADMIN, WAITING_PLAYER_POSITION, WAITING_PLAYER_RATING
-) = range(9)
+    WAITING_MANAGER_NAME, WAITING_TEAM_NAME, WAITING_EDIT_INPUT,
+    WAITING_ACCESS_NAME, WAITING_ADMIN_TEAM_NAME
+) = range(11)
 
 class EFootballAuctionBot:
     def __init__(self):
@@ -79,12 +80,13 @@ class EFootballAuctionBot:
         # Bot state
         self.startup_time = datetime.now()
         self.active_countdowns = {}
-        self.auction_queue = []  # Queue for multiple players
-        self.session_break_timer = 30  # Default 30 seconds between auctions
+        self.application = None  # Store application reference
         
     async def post_init(self, application: Application) -> None:
         """Initialize after bot is built"""
         try:
+            self.application = application  # Store application reference
+            
             # Test database connection
             logger.info("🔄 Connecting to MongoDB...")
             await self.db.client.admin.command('ping')
@@ -97,10 +99,22 @@ class EFootballAuctionBot:
             self.admin_handlers = AdminHandlers(self.db, application.bot)
             self.user_handlers = UserHandlers(self.db, application.bot)
             self.auction_handlers = AuctionHandlers(self.db, application.bot, self.countdown, self.analytics)
-            self.callback_handlers = CallbackHandlers(self.db, application.bot, self.admin_handlers, self.user_handlers)
             
-            # Set auction handlers reference in admin handlers
+            # Set cross-references
+            self.user_handlers.admin_handlers = self.admin_handlers
             self.admin_handlers.auction_handlers = self.auction_handlers
+
+            # Initialize callback handlers with all handler references
+            self.callback_handlers = CallbackHandlers(
+                self.db, 
+                application.bot, 
+                self.admin_handlers, 
+                self.user_handlers,
+                self.auction_handlers
+            )
+
+            # Set handler references in admin handlers
+            self.admin_handlers.callback_handlers = self.callback_handlers
             
             # Update admin list from database
             await self.db.update_admin_list()
@@ -130,7 +144,6 @@ class EFootballAuctionBot:
             BotCommand("bid", "🎯 Place a bid"),
             BotCommand("mystats", "📊 View your statistics"),
             BotCommand("leaderboard", "🏆 View leaderboard"),
-            BotCommand("myteam", "👥 View my team"),
         ]
         
         admin_commands = commands + [
@@ -143,9 +156,6 @@ class EFootballAuctionBot:
             BotCommand("broadcast", "📢 Send announcement"),
             BotCommand("groups", "🏢 Manage groups"),
             BotCommand("analytics", "📈 View analytics"),
-            BotCommand("add_manager", "➕ Add new manager"),
-            BotCommand("add_admin", "👮 Add new admin"),
-            BotCommand("clear_all", "🗑️ Clear all data"),
         ]
         
         await application.bot.set_my_commands(commands)
@@ -261,21 +271,12 @@ class EFootballAuctionBot:
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Send with animation
-        try:
-            await update.message.reply_animation(
-                animation=WELCOME_GIF,
-                caption=welcome_msg,
-                reply_markup=reply_markup,
-                parse_mode='HTML'
-            )
-        except:
-            # Fallback to text message
-            await update.message.reply_text(
-                welcome_msg,
-                reply_markup=reply_markup,
-                parse_mode='HTML'
-            )
+        # Send WITHOUT animation/GIF - this was causing the button issues
+        await update.message.reply_text(
+            welcome_msg,
+            reply_markup=reply_markup,
+            parse_mode='HTML'
+        )
         
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Interactive help command"""
@@ -334,16 +335,15 @@ Select a help topic below:
         return WAITING_MANAGER_INPUT
         
     async def add_manager_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle manager input"""
-        if update.message.text and update.message.text.lower() == 'cancel':
+        """Handle manager input - Step 1: Get user ID"""
+        if update.message.text.lower() == 'cancel':
             await update.message.reply_text(f"{EMOJI_ICONS['info']} Operation cancelled.")
             return ConversationHandler.END
-            
+        
         # Handle forwarded message
         if update.message.forward_from:
             user = update.message.forward_from
             user_id = user.id
-            name = user.full_name
             username = user.username
         else:
             # Handle text input
@@ -354,7 +354,6 @@ Select a help topic below:
                 try:
                     user = await context.bot.get_chat(text)
                     user_id = user.id
-                    name = user.full_name or user.title
                     username = user.username
                 except:
                     await update.message.reply_text(
@@ -366,7 +365,6 @@ Select a help topic below:
                 try:
                     user_id = int(text)
                     user = await context.bot.get_chat(user_id)
-                    name = user.full_name or user.title
                     username = user.username
                 except:
                     await update.message.reply_text(
@@ -378,22 +376,81 @@ Select a help topic below:
                     f"{EMOJI_ICONS['error']} Invalid format! Use @username, user ID, or forward a message."
                 )
                 return WAITING_MANAGER_INPUT
-                
+        
         # Check if already exists
         existing = await self.db.get_manager(user_id)
         if existing:
             await update.message.reply_text(
                 f"{EMOJI_ICONS['warning']} Manager already exists!\n"
                 f"Name: {existing.name}\n"
+                f"Team: {existing.team_name or 'Not set'}\n"
                 f"Balance: {self.formatter.format_currency(existing.balance)}"
             )
             return ConversationHandler.END
-            
-        # Add manager
+        
+        # Store user info in context
+        context.user_data['new_manager'] = {
+            'user_id': user_id,
+            'username': username
+        }
+        
+        # Ask for display name
+        await update.message.reply_text(
+            f"{EMOJI_ICONS['user']} <b>Enter Display Name</b>\n\n"
+            f"Enter the name to display for this manager:\n"
+            f"(This helps identify users better than usernames)\n\n"
+            f"Type 'skip' to use their Telegram name",
+            parse_mode='HTML'
+        )
+        return WAITING_MANAGER_NAME
+
+    async def add_manager_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle manager name input"""
+        text = update.message.text.strip()
+        
+        if text.lower() == 'cancel':
+            await update.message.reply_text(f"{EMOJI_ICONS['info']} Operation cancelled.")
+            return ConversationHandler.END
+        
+        if text.lower() == 'skip':
+            # Try to get name from Telegram
+            try:
+                user = await context.bot.get_chat(context.user_data['new_manager']['user_id'])
+                name = user.full_name or user.title or "Unknown"
+            except:
+                name = "Unknown"
+        else:
+            name = text
+        
+        context.user_data['new_manager']['name'] = name
+        
+        # Ask for team name
+        await update.message.reply_text(
+            f"{EMOJI_ICONS['team']} <b>Enter Team Name</b>\n\n"
+            f"Enter the team name for this manager:\n"
+            f"(Optional - helps identify their team)\n\n"
+            f"Type 'skip' to leave empty",
+            parse_mode='HTML'
+        )
+        return WAITING_TEAM_NAME
+
+    async def add_manager_team(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle team name input and create manager"""
+        text = update.message.text.strip()
+        
+        if text.lower() == 'cancel':
+            await update.message.reply_text(f"{EMOJI_ICONS['info']} Operation cancelled.")
+            return ConversationHandler.END
+        
+        team_name = None if text.lower() == 'skip' else text
+        
+        # Create manager
+        manager_data = context.user_data['new_manager']
         manager = Manager(
-            user_id=user_id,
-            name=name,
-            username=username
+            user_id=manager_data['user_id'],
+            name=manager_data['name'],
+            username=manager_data['username'],
+            team_name=team_name
         )
         
         success = await self.db.add_manager(manager)
@@ -401,8 +458,9 @@ Select a help topic below:
         if success:
             await update.message.reply_text(
                 f"{EMOJI_ICONS['success']} <b>Manager Added Successfully!</b>\n\n"
-                f"{EMOJI_ICONS['user']} Name: {name}\n"
-                f"{EMOJI_ICONS['id']} ID: <code>{user_id}</code>\n"
+                f"{EMOJI_ICONS['user']} Name: {manager.name}\n"
+                f"{EMOJI_ICONS['team']} Team: {team_name or 'Not set'}\n"
+                f"{EMOJI_ICONS['id']} ID: <code>{manager.user_id}</code>\n"
                 f"{EMOJI_ICONS['money']} Balance: {self.formatter.format_currency(DEFAULT_BALANCE)}\n\n"
                 f"They can now use the bot!",
                 parse_mode='HTML'
@@ -411,9 +469,11 @@ Select a help topic below:
             # Notify the new manager
             try:
                 await context.bot.send_message(
-                    user_id,
+                    manager.user_id,
                     f"{EMOJI_ICONS['celebration']} <b>Welcome to eFootball Auction!</b>\n\n"
                     f"You've been registered as a manager.\n"
+                    f"Name: {manager.name}\n"
+                    f"Team: {team_name or 'Not set'}\n"
                     f"Starting balance: {self.formatter.format_currency(DEFAULT_BALANCE)}\n\n"
                     f"Use /start to begin!",
                     parse_mode='HTML'
@@ -422,78 +482,7 @@ Select a help topic below:
                 pass
         else:
             await update.message.reply_text(f"{EMOJI_ICONS['error']} Failed to add manager!")
-            
-        return ConversationHandler.END
         
-    async def add_admin_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start add admin conversation"""
-        user_id = update.effective_user.id
-        
-        if user_id != SUPER_ADMIN_ID:
-            await update.message.reply_text(f"{EMOJI_ICONS['error']} Only super admin can add admins!")
-            return ConversationHandler.END
-            
-        await update.message.reply_text(
-            f"{EMOJI_ICONS['shield']} <b>ADD NEW ADMIN</b>\n\n"
-            f"Please provide:\n"
-            f"• User ID (e.g., 123456789)\n"
-            f"• Username (e.g., @username)\n"
-            f"• Or forward a message from the user\n\n"
-            f"Type 'cancel' to abort.",
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Cancel", callback_data="cancel_operation")
-            ]])
-        )
-        return WAITING_ADD_ADMIN
-        
-    async def add_admin_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle admin input"""
-        if update.message.text and update.message.text.lower() == 'cancel':
-            await update.message.reply_text(f"{EMOJI_ICONS['info']} Operation cancelled.")
-            return ConversationHandler.END
-            
-        # Similar logic to add_manager_input but for admins
-        # ... (similar parsing logic)
-        
-        # For brevity, assuming we have user_id, name, username
-        text = update.message.text.strip()
-        if text.isdigit():
-            user_id = int(text)
-            try:
-                user = await context.bot.get_chat(user_id)
-                name = user.full_name or user.title
-                username = user.username
-            except:
-                await update.message.reply_text(f"{EMOJI_ICONS['error']} User not found!")
-                return WAITING_ADD_ADMIN
-        else:
-            await update.message.reply_text(f"{EMOJI_ICONS['error']} Please provide a valid user ID!")
-            return WAITING_ADD_ADMIN
-            
-        # Add as admin
-        await self.db.make_admin(user_id)
-        
-        await update.message.reply_text(
-            f"{EMOJI_ICONS['success']} <b>Admin Added Successfully!</b>\n\n"
-            f"{EMOJI_ICONS['shield']} Name: {name}\n"
-            f"{EMOJI_ICONS['id']} ID: <code>{user_id}</code>\n\n"
-            f"They now have admin privileges!",
-            parse_mode='HTML'
-        )
-        
-        # Notify the new admin
-        try:
-            await context.bot.send_message(
-                user_id,
-                f"{EMOJI_ICONS['shield']} <b>Admin Access Granted!</b>\n\n"
-                f"You now have admin privileges in eFootball Auction Bot.\n"
-                f"Use /start to see admin options.",
-                parse_mode='HTML'
-            )
-        except:
-            pass
-            
         return ConversationHandler.END
         
     async def broadcast_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -595,46 +584,258 @@ Select a help topic below:
         )
         
         return ConversationHandler.END
+    
+    async def handle_edit_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle edit input from admin"""
+        user_id = update.effective_user.id
+        
+        if user_id not in ADMIN_IDS:
+            await update.message.reply_text(f"{EMOJI_ICONS['error']} Admin access required!")
+            return ConversationHandler.END
+        
+        editing_user_id = context.user_data.get('editing_user_id')
+        edit_type = context.user_data.get('edit_type')
+        
+        if not editing_user_id or not edit_type:
+            await update.message.reply_text(f"{EMOJI_ICONS['error']} Error: Lost context. Please try again.")
+            return ConversationHandler.END
+        
+        text = update.message.text.strip()
+        
+        if edit_type == 'name':
+            # Update name
+            result = await self.db.managers.update_one(
+                {"user_id": editing_user_id},
+                {"$set": {"name": text}}
+            )
+            
+            if result.modified_count > 0:
+                await update.message.reply_text(
+                    f"{EMOJI_ICONS['success']} Name updated successfully!\n"
+                    f"New name: {text}"
+                )
+            else:
+                await update.message.reply_text(f"{EMOJI_ICONS['error']} Failed to update name!")
+                
+        elif edit_type == 'team':
+            # Update team
+            team_name = None if text.lower() == 'none' else text
+            result = await self.db.managers.update_one(
+                {"user_id": editing_user_id},
+                {"$set": {"team_name": team_name}}
+            )
+            
+            if result.modified_count > 0:
+                await update.message.reply_text(
+                    f"{EMOJI_ICONS['success']} Team updated successfully!\n"
+                    f"New team: {team_name or 'Not set'}"
+                )
+            else:
+                await update.message.reply_text(f"{EMOJI_ICONS['error']} Failed to update team!")
+                
+        elif edit_type == 'balance':
+            # Update balance
+            try:
+                # Parse balance
+                if '.' in text:
+                    balance = int(float(text) * 1_000_000)
+                else:
+                    balance = int(text) * 1_000_000
+                
+                if balance < 0:
+                    await update.message.reply_text(f"{EMOJI_ICONS['error']} Balance cannot be negative!")
+                    return ConversationHandler.END
+                
+                result = await self.db.managers.update_one(
+                    {"user_id": editing_user_id},
+                    {"$set": {"balance": balance}}
+                )
+                
+                if result.modified_count > 0:
+                    await update.message.reply_text(
+                        f"{EMOJI_ICONS['success']} Balance updated successfully!\n"
+                        f"New balance: {self.formatter.format_currency(balance)}"
+                    )
+                else:
+                    await update.message.reply_text(f"{EMOJI_ICONS['error']} Failed to update balance!")
+                    
+            except ValueError:
+                await update.message.reply_text(f"{EMOJI_ICONS['error']} Invalid balance format! Use numbers only.")
+                return ConversationHandler.END
+        
+        # Clear context
+        context.user_data.clear()
+        return ConversationHandler.END
         
     async def cancel_operation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Cancel any ongoing operation"""
         query = update.callback_query
-        if query:
-            await query.answer()
-            await query.edit_message_text(f"{EMOJI_ICONS['info']} Operation cancelled.")
-        else:
-            await update.message.reply_text(f"{EMOJI_ICONS['info']} Operation cancelled.")
+        await query.answer()
+        
+        await query.edit_message_text(
+            f"{EMOJI_ICONS['info']} Operation cancelled."
+        )
         return ConversationHandler.END
+    
+    async def _start_edit_conversation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start edit conversation from callback"""
+        query = update.callback_query
+        await self.callback_handlers.handle_callback(query, context)
+        # Check if edit type was set
+        if 'edit_type' in context.user_data:
+            return WAITING_EDIT_INPUT
+        return ConversationHandler.END
+    
+    async def handle_access_name_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle name input during access request"""
+        if update.message.text and update.message.text.lower() == 'cancel':
+            await update.message.reply_text(f"{EMOJI_ICONS['info']} Request cancelled.")
+            return ConversationHandler.END
         
-    async def clear_all_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Clear all data from database"""
+        name = update.message.text.strip()
+        
+        if not name or len(name) < 2:
+            await update.message.reply_text(
+                f"{EMOJI_ICONS['error']} Please enter a valid name (at least 2 characters):"
+            )
+            return WAITING_ACCESS_NAME
+        
+        # Store name in context
+        context.user_data['access_request_name'] = name
+        
         user_id = update.effective_user.id
+        username = update.effective_user.username
         
-        if user_id != SUPER_ADMIN_ID:
-            await update.message.reply_text(f"{EMOJI_ICONS['error']} Only super admin can clear all data!")
-            return
-            
-        # Confirmation keyboard
-        keyboard = [
-            [
-                InlineKeyboardButton("⚠️ YES, DELETE ALL", callback_data="confirm_clear_all"),
-                InlineKeyboardButton("❌ Cancel", callback_data="cancel_clear_all")
-            ]
-        ]
+        # Check if request already exists
+        existing_request = await self.db.join_requests.find_one({
+            'user_id': user_id,
+            'status': 'pending'
+        })
+        
+        if existing_request:
+            await update.message.reply_text(
+                f"{EMOJI_ICONS['warning']} You already have a pending request!"
+            )
+            return ConversationHandler.END
+        
+        # Add to join requests with provided name
+        request_data = {
+            'user_id': user_id,
+            'user_name': name,  # Use provided name instead of Telegram name
+            'username': username,
+            'chat_id': update.message.chat.id,
+            'status': 'pending',
+            'created_at': datetime.now()
+        }
+        
+        await self.db.join_requests.insert_one(request_data)
         
         await update.message.reply_text(
-            f"{EMOJI_ICONS['warning']} <b>⚠️ DANGER ZONE ⚠️</b>\n\n"
-            f"This will permanently delete:\n"
-            f"• All managers (except admins)\n"
-            f"• All auction history\n"
-            f"• All player data\n"
-            f"• All analytics\n"
-            f"• All settings\n\n"
-            f"<b>This action CANNOT be undone!</b>\n\n"
-            f"Are you absolutely sure?",
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            f"{EMOJI_ICONS['success']} <b>REQUEST SUBMITTED!</b>\n\n"
+            f"✅ Name: <b>{name}</b>\n"
+            f"📋 Your access request has been sent to admins\n"
+            f"⏳ You'll be notified once processed\n\n"
+            f"Use /start to return to the main menu.",
+            parse_mode='HTML'
         )
+        
+        # Notify all admins
+        for admin_id in ADMIN_IDS:
+            try:
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ Approve", callback_data=f"approve_request_{user_id}"),
+                        InlineKeyboardButton("❌ Reject", callback_data=f"reject_request_{user_id}")
+                    ]
+                ]
+                
+                await context.bot.send_message(
+                    admin_id,
+                    f"{EMOJI_ICONS['bell']} <b>NEW ACCESS REQUEST</b>\n\n"
+                    f"{EMOJI_ICONS['user']} Name: <b>{name}</b>\n"
+                    f"{EMOJI_ICONS['id']} ID: <code>{user_id}</code>\n"
+                    f"{EMOJI_ICONS['at']} Username: @{username or 'None'}\n"
+                    f"{EMOJI_ICONS['clock']} Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+                    f"Click below to approve or reject:",
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify admin {admin_id}: {e}")
+        
+        return ConversationHandler.END
+
+    async def handle_admin_team_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle team name input from admin during approval"""
+        if update.message.text and update.message.text.lower() == 'cancel':
+            await update.message.reply_text(f"{EMOJI_ICONS['info']} Approval cancelled.")
+            return ConversationHandler.END
+        
+        team_name = update.message.text.strip()
+        
+        # Get stored user info
+        user_id = context.user_data.get('approving_user_id')
+        user_name = context.user_data.get('approving_user_name')
+        username = context.user_data.get('approving_username')
+        
+        if not user_id:
+            await update.message.reply_text(f"{EMOJI_ICONS['error']} Error: Lost context. Please try again.")
+            return ConversationHandler.END
+        
+        # Process team name
+        if team_name.lower() == 'skip':
+            team_name = None
+        
+        # Create manager
+        manager = Manager(
+            user_id=user_id,
+            name=user_name,
+            username=username,
+            team_name=team_name
+        )
+        
+        success = await self.db.add_manager(manager)
+        
+        if success:
+            # Update request status
+            await self.db.join_requests.update_one(
+                {'user_id': user_id, 'status': 'pending'},
+                {'$set': {'status': 'approved', 'processed_by': update.effective_user.id}}
+            )
+            
+            await update.message.reply_text(
+                f"{EMOJI_ICONS['success']} <b>MANAGER APPROVED!</b>\n\n"
+                f"{EMOJI_ICONS['user']} Name: <b>{user_name}</b>\n"
+                f"{EMOJI_ICONS['team']} Team: <b>{team_name or 'Not set'}</b>\n"
+                f"{EMOJI_ICONS['money']} Balance: {self.formatter.format_currency(DEFAULT_BALANCE)}\n\n"
+                f"✅ User has been notified!",
+                parse_mode='HTML'
+            )
+            
+            # Notify the user
+            try:
+                welcome_keyboard = [[InlineKeyboardButton("🏠 Get Started", callback_data="start")]]
+                
+                await context.bot.send_message(
+                    user_id,
+                    f"{EMOJI_ICONS['celebration']} <b>ACCESS GRANTED!</b>\n\n"
+                    f"🎉 Welcome to eFootball Auction!\n"
+                    f"📝 Name: <b>{user_name}</b>\n"
+                    f"🏆 Team: <b>{team_name or 'Not assigned yet'}</b>\n"
+                    f"💰 Starting Balance: {self.formatter.format_currency(DEFAULT_BALANCE)}\n\n"
+                    f"🚀 You're now ready to participate in auctions!\n"
+                    f"Use the button below to start exploring.",
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup(welcome_keyboard)
+                )
+            except Exception as e:
+                logger.warning(f"Failed to notify approved user {user_id}: {e}")
+        else:
+            await update.message.reply_text(f"{EMOJI_ICONS['error']} Failed to create manager!")
+        
+        # Clear context
+        context.user_data.clear()
+        return ConversationHandler.END
         
     def add_handlers(self, application):
         """Add all command and message handlers"""
@@ -644,19 +845,12 @@ Select a help topic below:
             states={
                 WAITING_MANAGER_INPUT: [
                     MessageHandler(filters.TEXT | filters.StatusUpdate.USER_SHARED, self.add_manager_input)
-                ]
-            },
-            fallbacks=[
-                CallbackQueryHandler(self.cancel_operation, pattern="^cancel_operation$"),
-                CommandHandler("cancel", self.cancel_operation)
-            ]
-        )
-        
-        add_admin_conv = ConversationHandler(
-            entry_points=[CommandHandler("add_admin", self.add_admin_start)],
-            states={
-                WAITING_ADD_ADMIN: [
-                    MessageHandler(filters.TEXT, self.add_admin_input)
+                ],
+                WAITING_MANAGER_NAME: [
+                    MessageHandler(filters.TEXT, self.add_manager_name)
+                ],
+                WAITING_TEAM_NAME: [
+                    MessageHandler(filters.TEXT, self.add_manager_team)
                 ]
             },
             fallbacks=[
@@ -680,11 +874,65 @@ Select a help topic below:
                 CommandHandler("cancel", self.cancel_operation)
             ]
         )
+
+        edit_manager_conv = ConversationHandler(
+            entry_points=[
+                CallbackQueryHandler(
+                    self._start_edit_conversation,
+                    pattern="^(edit_name_|edit_team_|edit_balance_)"
+                )
+            ],
+            states={
+                WAITING_EDIT_INPUT: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_edit_input)
+                ]
+            },
+            fallbacks=[
+                CommandHandler("cancel", self.cancel_operation)
+            ],
+            per_message=False,
+            per_chat=False  # Track by user, not chat
+        )
+
+        access_request_conv = ConversationHandler(
+            entry_points=[CallbackQueryHandler(
+                self._start_access_request_conversation,
+                pattern="^request_access$"
+            )],
+            states={
+                WAITING_ACCESS_NAME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_access_name_input)
+                ]
+            },
+            fallbacks=[
+                CommandHandler("cancel", self.cancel_operation),
+                CommandHandler("start", self.start_command)
+            ],
+            per_message=False
+        )
+        
+        admin_approval_conv = ConversationHandler(
+            entry_points=[CallbackQueryHandler(
+                self._start_approval_conversation,
+                pattern="^approve_request_"
+            )],
+            states={
+                WAITING_ADMIN_TEAM_NAME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_admin_team_input)
+                ]
+            },
+            fallbacks=[
+                CommandHandler("cancel", self.cancel_operation)
+            ],
+            per_message=False
+        )
         
         # Add conversation handlers
         application.add_handler(add_manager_conv)
-        application.add_handler(add_admin_conv)
         application.add_handler(broadcast_conv)
+        application.add_handler(edit_manager_conv)
+        application.add_handler(access_request_conv)
+        application.add_handler(admin_approval_conv)
         
         # Basic commands
         application.add_handler(CommandHandler("start", self.start_command))
@@ -701,22 +949,29 @@ Select a help topic below:
         application.add_handler(CommandHandler("continue_auction", self.handle_continue_auction))
         application.add_handler(CommandHandler("groups", self.handle_groups))
         application.add_handler(CommandHandler("analytics", self.handle_analytics))
-        application.add_handler(CommandHandler("clear_all", self.clear_all_data))
+        application.add_handler(CommandHandler("managers_summary", self.handle_managers_summary))
+        application.add_handler(CommandHandler("managers_detailed", self.handle_managers_detailed))
+        application.add_handler(CommandHandler("next", self.handle_next_player))
         
         # User commands
         application.add_handler(CommandHandler("bid", self.handle_bid))
         application.add_handler(CommandHandler("balance", self.handle_balance))
         application.add_handler(CommandHandler("mystats", self.handle_mystats))
         application.add_handler(CommandHandler("leaderboard", self.handle_leaderboard))
-        application.add_handler(CommandHandler("myteam", self.handle_myteam))
+        
+        # This handler specifically for auction group
+        application.add_handler(MessageHandler(
+            filters.Regex(r'^\d+(?:\.\d+)?$') & filters.Chat(AUCTION_GROUP_ID),
+            self.handle_number_bid
+        ))
         
         # Message handlers
         application.add_handler(MessageHandler(
             filters.ChatType.GROUPS & ~filters.COMMAND, 
             self.handle_group_messages
         ))
-        
-        # Callback query handler - MUST BE LAST
+
+        # Callback query handler - MUST BE AFTER CONVERSATION HANDLERS
         application.add_handler(CallbackQueryHandler(self.button_callback))
         
         # Error handler
@@ -762,6 +1017,18 @@ Select a help topic below:
     async def handle_analytics(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if self.admin_handlers:
             await self.admin_handlers.analytics_command(update, context)
+
+    async def handle_managers_summary(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self.admin_handlers:
+            await self.admin_handlers.show_all_managers_summary(update, context)
+
+    async def handle_managers_detailed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self.admin_handlers:
+            await self.admin_handlers.show_all_managers_detailed(update, context)
+    
+    async def handle_next_player(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self.admin_handlers:
+            await self.admin_handlers.next_player_command(update, context)
     
     # Wrapper methods for user handlers
     async def handle_bid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -779,10 +1046,24 @@ Select a help topic below:
     async def handle_leaderboard(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if self.user_handlers:
             await self.user_handlers.show_leaderboard(update, context)
-            
-    async def handle_myteam(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    async def handle_number_bid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle number-only bids in auction group"""
+        if update.message.chat_id != AUCTION_GROUP_ID:
+            return
+        
+        # Delete the message to keep chat clean
+        try:
+            await update.message.delete()
+        except:
+            pass
+        
+        # Set context args for bid processing
+        context.args = [update.message.text]
+        
+        # Process as bid
         if self.user_handlers:
-            await self.user_handlers.show_my_team_command(update, context)
+            await self.user_handlers.place_bid(update, context)
     
     async def handle_group_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle messages in groups"""
@@ -796,8 +1077,103 @@ Select a help topic below:
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Route all callback queries"""
         query = update.callback_query
+
+        try:
+            await query.answer()
+        except:
+            pass
+
         if self.callback_handlers:
             await self.callback_handlers.handle_callback(query, context)
+
+    async def _start_access_request_conversation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start access request conversation"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = query.from_user.id
+        
+        # Check if already registered
+        manager = await self.db.get_manager(user_id)
+        if manager:
+            await query.edit_message_text(
+                f"{EMOJI_ICONS['success']} <b>ALREADY REGISTERED</b>\n\n"
+                f"You're already a registered manager!\n"
+                f"Use /start to access your dashboard.",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Dashboard", callback_data="start")
+                ]])
+            )
+            return ConversationHandler.END
+        
+        # Check if request already exists
+        existing_request = await self.db.join_requests.find_one({
+            'user_id': user_id,
+            'status': 'pending'
+        })
+        
+        if existing_request:
+            await query.edit_message_text(
+                f"{EMOJI_ICONS['clock']} <b>REQUEST PENDING</b>\n\n"
+                f"Your access request is already under review.\n"
+                f"Please wait for admin approval.",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Back", callback_data="start")
+                ]])
+            )
+            return ConversationHandler.END
+        
+        await query.edit_message_text(
+            f"{EMOJI_ICONS['user']} <b>REQUEST ACCESS</b>\n\n"
+            f"To join as a manager, please provide your name:\n"
+            f"(This will be displayed in auctions and leaderboards)\n\n"
+            f"💡 <i>Use your real name</i>",
+            parse_mode='HTML'
+        )
+        
+        return WAITING_ACCESS_NAME
+
+    async def _start_approval_conversation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start admin approval conversation"""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.from_user.id not in ADMIN_IDS:
+            await query.answer("Admin access required!", show_alert=True)
+            return ConversationHandler.END
+        
+        data = query.data
+        user_id = int(data.replace("approve_request_", ""))
+        
+        # Get request details
+        request = await self.db.join_requests.find_one({
+            'user_id': user_id,
+            'status': 'pending'
+        })
+        
+        if not request:
+            await query.edit_message_text(
+                f"{EMOJI_ICONS['error']} Request not found or already processed!"
+            )
+            return ConversationHandler.END
+        
+        # Store user info in context
+        context.user_data['approving_user_id'] = user_id
+        context.user_data['approving_user_name'] = request['user_name']
+        context.user_data['approving_username'] = request.get('username')
+        
+        await query.edit_message_text(
+            f"{EMOJI_ICONS['team']} <b>SET TEAM NAME</b>\n\n"
+            f"👤 Manager: <b>{request['user_name']}</b>\n"
+            f"🆔 ID: <code>{user_id}</code>\n\n"
+            f"Enter a team name for this manager:\n"
+            f"(Optional - type 'skip' to leave empty)",
+            parse_mode='HTML'
+        )
+        
+        return WAITING_ADMIN_TEAM_NAME
     
     def run(self):
         """Start the bot with enhanced error handling"""
