@@ -3,7 +3,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from telegram.ext import ContextTypes
 from telegram.error import BadRequest, Forbidden
 from bson import ObjectId
@@ -718,10 +718,15 @@ Your balance: {self.formatter.format_currency(manager.balance)}
                 
         return display
         
-    async def show_achievements(self, update, context, manager: Optional[Manager] = None):
+    async def show_achievements(self, query_or_update: CallbackQuery | Update, context, manager: Optional[Manager] = None):
         """Show user achievements with progress"""
-        query = update.callback_query if hasattr(update, 'callback_query') else None
-        user_id = query.from_user.id if query else update.effective_user.id
+        if isinstance(query_or_update, CallbackQuery):
+            query = query_or_update
+            user_id = query.from_user.id
+        else:
+            update = query_or_update
+            query = update.callback_query
+            user_id = update.effective_user.id
         
         if not manager:
             manager = await self.db.get_manager(user_id)

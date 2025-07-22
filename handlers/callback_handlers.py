@@ -2,7 +2,7 @@
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from telegram.ext import ContextTypes
 from telegram.error import BadRequest
 from bson import ObjectId
@@ -207,7 +207,11 @@ class CallbackHandlers:
         # Get current settings
         current_mode = await self.db.get_setting("auction_mode") or ("auto" if AUTO_MODE else "manual")
         current_timer = await self.db.get_setting("auction_timer") or AUCTION_TIMER
-        current_break = await self.db.get_setting("auction_break") or 30
+        raw = await self.db.get_setting("auction_break")
+        if raw is None:
+            current_break = 30
+        else:
+            current_break = int(raw)
         current_budget = await self.db.get_setting("default_balance") or DEFAULT_BALANCE
         analytics_enabled = await self.db.get_setting("track_analytics")
         if analytics_enabled is None:
@@ -649,7 +653,11 @@ Select a timer duration:
         
     async def _show_break_settings(self, query, context):
         """Show break timer settings"""
-        current_break = await self.db.get_setting("auction_break") or 30
+        raw = await self.db.get_setting("auction_break")
+        if raw is None:
+            current_break = 30
+        else:
+            current_break = int(raw)
         
         msg = f"""
 {EMOJI_ICONS['clock']} <b>BREAK TIMER SETTINGS</b>
@@ -663,14 +671,14 @@ Select a break duration:
         
         keyboard = [
             [
+                InlineKeyboardButton("None (0)", callback_data="break_set_0"),
                 InlineKeyboardButton("⚡ Quick (10s)", callback_data="break_set_10"),
-                InlineKeyboardButton("⏱️ 20s", callback_data="break_set_20"),
-                InlineKeyboardButton("⏰ 30s", callback_data="break_set_30")
+                InlineKeyboardButton("⏱️ 20s", callback_data="break_set_20")
             ],
             [
-                InlineKeyboardButton("⏳ 40s", callback_data="break_set_40"),
-                InlineKeyboardButton("⌛ 60s", callback_data="break_set_60"),
-                InlineKeyboardButton("🐌 90s", callback_data="break_set_90")
+                InlineKeyboardButton("⏰ 30s", callback_data="break_set_30"),
+                InlineKeyboardButton("⌛ 40s", callback_data="break_set_40"),
+                InlineKeyboardButton("🐌 60s", callback_data="break_set_60")
             ],
             [InlineKeyboardButton("🔙 Back", callback_data="admin_settings")]
         ]
@@ -1383,7 +1391,7 @@ Are you absolutely sure?
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         
-    async def _handle_achievements(self, query, context):
+    async def _handle_achievements(self, query: CallbackQuery, context):
         """Handle achievements callback"""
         manager = await self.db.get_manager(query.from_user.id)
         if not manager:

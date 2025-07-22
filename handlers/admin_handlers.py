@@ -748,7 +748,28 @@ class AdminHandlers:
     async def _start_break_timer(self, context):
         """Start break timer between auctions"""
         # Get break duration from settings
-        break_duration = await self.db.get_setting("auction_break") or AUCTION_BREAK
+        raw = await self.db.get_setting("auction_break")
+        if raw is None:
+            break_duration = AUCTION_BREAK
+        else:
+            break_duration = int(raw)
+
+        if break_duration == 0:
+            self.is_in_break = False
+            # if in auto mode, immediately continue; else, just notify admin
+            current_mode = await self.db.get_setting("auction_mode") or ("auto" if AUTO_MODE else "manual")
+            if current_mode == 'auto' and self.auction_queue:
+                await self._process_next_in_queue(context)
+            else:
+                if not self.auction_queue:
+                    await self._finish_auction_session(context)
+                else:
+                    await context.bot.send_message(
+                        AUCTION_GROUP_ID,
+                        f"{EMOJI_ICONS['info']} Break skipped. Admin can start next auction.",
+                        parse_mode='HTML'
+                    )
+            return
         
         # Set break flag
         self.is_in_break = True
@@ -902,7 +923,7 @@ Use /managers_summary or /managers_detailed to view full results.
                     await asyncio.sleep(0.1)
                     del self.auction_tasks[auction_id]
                 
-                timer_duration = auction.get('timer_duration', AUCTION_TIMER)
+                timer_duration = max(auction.get('timer_duration', AUCTION_TIMER) - 5, 0)
                 
                 # Reset countdown
                 reset_success = await self.countdown.reset_countdown(str(auction_id), timer_duration)

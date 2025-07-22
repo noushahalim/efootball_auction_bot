@@ -958,6 +958,7 @@ Select a help topic below:
         application.add_handler(CommandHandler("balance", self.handle_balance))
         application.add_handler(CommandHandler("mystats", self.handle_mystats))
         application.add_handler(CommandHandler("leaderboard", self.handle_leaderboard))
+        application.add_handler(CommandHandler("achievements", self.handle_achievements))
         
         # This handler specifically for auction group
         application.add_handler(MessageHandler(
@@ -1046,6 +1047,10 @@ Select a help topic below:
     async def handle_leaderboard(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if self.user_handlers:
             await self.user_handlers.show_leaderboard(update, context)
+    
+    async def handle_achievements(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self.user_handlers:
+            await self.user_handlers.show_achievements(update, context)
 
     async def handle_number_bid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle number-only bids in auction group"""
